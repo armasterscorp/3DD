@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-store';
-import { addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
+import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
+import { getUserApiKey } from '@/lib/captcha-solver';
+import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -854,6 +856,36 @@ export async function POST(request: NextRequest) {
     session.runId = runId;
     session.licenseId = licenseId;
     const { page } = session;
+    const savedApiKey = getUserApiKey(licenseId);
+    const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    const solvePreloadCaptcha = async () => {
+      if (!captchaHandler) return { status: 'unconfigured' as const };
+      addInquiryLog({ licenseId, runId, level: 'info', message: `attempting to solve pre-load CAPTCHA on ${target}` });
+      try {
+        const result = await Promise.race([
+          captchaHandler.handleCaptcha(page),
+          new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
+            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 5 seconds' }), 5_000)
+          ),
+        ]);
+        if (result.status === 'solved') {
+          addInquiryLog({ licenseId, runId, level: 'success', message: '✓ CAPTCHA solved' });
+        } else if (result.status === 'not_found') {
+          addInquiryLog({ licenseId, runId, level: 'info', message: 'no CAPTCHA detected' });
+        } else if (result.status === 'failed') {
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+        }
+        return result;
+      } catch (error) {
+        addInquiryLog({
+          licenseId,
+          runId,
+          level: 'warning',
+          message: `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`,
+        });
+        return { handled: false, status: 'failed' as const };
+      }
+    };
 
     try {
       await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 15_000 });
@@ -861,20 +893,11 @@ export async function POST(request: NextRequest) {
       // page before discovery can immediately navigate elsewhere or classify it.
       await visualActionPause(page, 900);
       await inquiryCheckpoint(licenseId);
+      await solvePreloadCaptcha();
     } catch (navigationError) {
       const challenge = await detectCaptcha(page);
       if (challenge.detected) {
-        session.targetUrl = target;
-        session.contactUrl = page.url();
-        session.lastPreparedAt = new Date().toISOString();
-        addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: challenge.provider || 'CAPTCHA', reason: 'Pre-site security challenge', values: profile as Record<string, unknown> });
-        // Keep the challenge visibly on screen so the live monitor shows exactly
-        // why this target is being skipped.
-        await visualActionPause(page, 2200);
-        return NextResponse.json({
-          success: true, classification: 'captcha', target, contactUrl: page.url(), currentUrl: page.url(), discovery: 'pre-site security challenge',
-          captchaDetected: true, captchaProvider: challenge.provider || 'CAPTCHA', detected: [], extras: [], submitVisible: false, fieldCount: 0,
-        });
+        await solvePreloadCaptcha();
       }
       if (isUnavailableNavigationError(navigationError)) {
         addInquiryResult({ licenseId, runId, sessionId, status: 'failed', target, contactUrl: page.url() || target, reason: shortUnavailableReason(navigationError), values: profile as Record<string, unknown> });
@@ -896,15 +919,7 @@ export async function POST(request: NextRequest) {
 
     const pageCaptcha = await detectCaptcha(page);
     if (pageCaptcha.detected) {
-      session.targetUrl = target;
-      session.contactUrl = page.url();
-      session.lastPreparedAt = new Date().toISOString();
-      addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: pageCaptcha.provider || 'CAPTCHA', reason: 'Pre-site security challenge', values: profile as Record<string, unknown> });
-      await visualActionPause(page, 2200);
-      return NextResponse.json({
-        success: true, classification: 'captcha', target, contactUrl: page.url(), currentUrl: page.url(), discovery: 'pre-site security challenge',
-        captchaDetected: true, captchaProvider: pageCaptcha.provider || 'CAPTCHA', detected: [], extras: [], submitVisible: false, fieldCount: 0,
-      });
+      await solvePreloadCaptcha();
     }
 
     await inquiryCheckpoint(licenseId);

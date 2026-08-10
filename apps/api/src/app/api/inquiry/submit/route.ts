@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-store';
-import { addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
+import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
+import { getUserApiKey } from '@/lib/captcha-solver';
+import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -350,6 +352,36 @@ export async function POST(request: NextRequest) {
       const result = addInquiryResult({ licenseId, runId, sessionId, status: 'review', target, contactUrl: page.url(), reason, values: session.profile || {} });
       return NextResponse.json({ success: false, reviewRequired: true, reason, resultId: result.id, steps }, { status: 409 });
     };
+    const savedApiKey = getUserApiKey(licenseId);
+    const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    const solveCaptchaWithTimeout = async (message: string) => {
+      if (!captchaHandler) return { status: 'unconfigured' as const };
+      addInquiryLog({ licenseId, runId, level: 'info', message });
+      try {
+        const result = await Promise.race([
+          captchaHandler.handleCaptcha(page),
+          new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
+            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 5 seconds' }), 5_000)
+          ),
+        ]);
+        if (result.status === 'solved') {
+          addInquiryLog({ licenseId, runId, level: 'success', message: '✓ CAPTCHA solved' });
+        } else if (result.status === 'not_found') {
+          addInquiryLog({ licenseId, runId, level: 'info', message: 'no CAPTCHA detected' });
+        } else if (result.status === 'failed') {
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+        }
+        return result;
+      } catch (error) {
+        addInquiryLog({
+          licenseId,
+          runId,
+          level: 'warning',
+          message: `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`,
+        });
+        return { handled: false, status: 'failed' as const };
+      }
+    };
 
     // Some inquiry forms use Next/Continue -> Review -> Submit. Walk those
     // visible form actions automatically, but stop on CAPTCHA or if the form
@@ -369,13 +401,15 @@ export async function POST(request: NextRequest) {
       const overlayState = await handleBlockingOverlays(page);
       if (overlayState.reviewRequired) return saveReview(overlayState.reviewRequired);
 
+      await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission');
       const captcha = await detectCaptcha(page, chosen);
       if (captcha.detected) {
-        addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: captcha.provider || 'CAPTCHA', reason: 'CAPTCHA detected during submit/review', values: session.profile || {} });
-        return NextResponse.json(
-          { success: false, captchaDetected: true, captchaProvider: captcha.provider || 'CAPTCHA', error: `CAPTCHA detected (${captcha.provider || 'CAPTCHA'}). This form was not submitted.` },
-          { status: 409 }
-        );
+        addInquiryLog({
+          licenseId,
+          runId,
+          level: 'warning',
+          message: `⚠ CAPTCHA still detected (${captcha.provider || 'CAPTCHA'}), continuing submission attempt`,
+        });
       }
 
       const submit = await findSubmitControl(chosen);
@@ -423,6 +457,13 @@ export async function POST(request: NextRequest) {
 
       const isIntermediate = /\b(next|continue|review|preview|suivant|continuer|poursuivre|reviser|aperçu|apercu)\b/i.test(label) && !/\b(send|submit|finish|complete|request|apply|envoyer|soumettre|terminer|finaliser)\b/i.test(label);
       if (!isIntermediate) {
+        await page.waitForTimeout(1200);
+        if (captchaHandler) {
+          const postSubmitCaptcha = await captchaHandler.checkPostSubmitCaptcha(page);
+          if (postSubmitCaptcha.detected) {
+            await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve');
+          }
+        }
         // A button label alone is not proof that the form was submitted. Wait
         // for an explicit success/confirmation state. If the site reveals
         // another section or gives no reliable confirmation, keep it for
