@@ -8,13 +8,14 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
+  id    String   @id @default(cuid())
+  email String   @unique
+  name  String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   campaigns Campaign[]
+  captchaConfig CaptchaConfig?
 
   @@map("users")
 }
@@ -109,4 +110,53 @@ model WeTransferAccount {
 
   @@index([campaignId])
   @@map("wetransfer_accounts")
+}
+
+// ====== 2CAPTCHA INTEGRATION ======
+
+model CaptchaConfig {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  apiKey        String   // Encrypted in production
+  isActive      Boolean  @default(false)
+  lastTestAt    DateTime?
+  lastTestStatus String? // success, failed
+  testError     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("captcha_configs")
+}
+
+model CaptchaQueue {
+  id            String   @id @default(cuid())
+  userId        String   // Per-license isolation
+  inquiryRunId  String   // Reference to inquiry run
+  targetUrl     String   // Website being processed
+  captchaType   String   // "recaptcha_v2", "recaptcha_v3", "turnstile", "hcaptcha"
+  siteKey       String?  // reCAPTCHA sitekey
+  websiteKey    String?  // Turnstile website key
+  minScore      Float?   // reCAPTCHA v3 only
+  pageAction    String?  // reCAPTCHA v3 only
+  
+  taskId        String?  // 2Captcha task ID
+  solution      String?  // Solved token
+  status        String   @default("pending") // pending, solving, solved, failed
+  attempts      Int      @default(0)
+  error         String?
+  cost          Float    @default(0)
+  
+  createdAt     DateTime @default(now())
+  solvedAt      DateTime?
+  expiresAt     DateTime // For cleanup of old entries
+
+  @@index([userId])
+  @@index([inquiryRunId])
+  @@index([status])
+  @@index([taskId])
+  @@index([createdAt])
+  @@map("captcha_queue")
 }
