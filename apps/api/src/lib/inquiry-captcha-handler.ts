@@ -9,6 +9,7 @@ export class InquiryCaptchaHandler {
   private runId: string;
   private apiKey: string | null;
   private solver: TwoCaptchaSolver | null;
+  private page: any;
 
   constructor(userId: string, runId: string, apiKey?: string) {
     this.userId = userId;
@@ -33,6 +34,8 @@ export class InquiryCaptchaHandler {
     solution?: string;
     error?: string;
   }> {
+    this.page = page;
+
     if (!this.solver) {
       console.log('[Inquiry CAPTCHA] CAPTCHA solving not configured');
       return { handled: false, status: 'unconfigured' };
@@ -90,11 +93,21 @@ export class InquiryCaptchaHandler {
     type?: string;
   }> {
     try {
-      // Simple check - if page URL changed significantly or captcha appeared, return true
+      this.page = page;
+
+      // Check for Turnstile
+      const hasTurnstile = await page.evaluate(
+        () => !!(window as any).turnstile && document.querySelector('.cf-turnstile')
+      );
+      if (hasTurnstile) {
+        return { detected: true, type: 'turnstile' };
+      }
+
+      // Check for reCAPTCHA
       const hasRecaptcha = await page.evaluate(
         () => !!(window as any).grecaptcha || document.querySelector('[data-sitekey]')
       );
-      
+
       return { detected: hasRecaptcha, type: 'recaptcha' };
     } catch {
       return { detected: false };
@@ -108,17 +121,31 @@ export class InquiryCaptchaHandler {
   ): Promise<{ siteKey: string } | null> {
     try {
       const siteKey = await page.evaluate(() => {
+        // Check for data-sitekey attribute
+        const container = document.querySelector('[data-sitekey]');
+        if (container && !document.querySelector('[data-sitekey][data-callback]')) {
+          // Not v3 (v3 has data-callback)
+          return container.getAttribute('data-sitekey');
+        }
+
+        // Check iframe method
         const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
         if (iframes.length > 0) {
-          const src = iframes[0].getAttribute('src') || '';
-          const match = src.match(/k=([^&]+)/);
-          return match ? match[1] : null;
+          for (const iframe of iframes) {
+            const src = iframe.getAttribute('src') || '';
+            if (!src.includes('v3')) {
+              const match = src.match(/k=([^&]+)/);
+              if (match) return match[1];
+            }
+          }
         }
-        return (window as any).__grecaptcha_render_params?.[0]?.sitekey || null;
+
+        return null;
       });
 
       return siteKey ? { siteKey } : null;
-    } catch {
+    } catch (error) {
+      console.error('[Inquiry CAPTCHA] reCAPTCHA v2 detection error:', error);
       return null;
     }
   }
@@ -128,19 +155,28 @@ export class InquiryCaptchaHandler {
   ): Promise<{ siteKey: string; minScore?: number } | null> {
     try {
       const result = await page.evaluate(() => {
+        // Check for data-sitekey with data-callback (v3 indicator)
+        const container = document.querySelector('[data-sitekey][data-callback]');
+        if (container) {
+          return container.getAttribute('data-sitekey');
+        }
+
+        // Check script src for v3
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
-          if (script.src?.includes('recaptcha') && script.src?.includes('v3')) {
-            const src = script.src;
+          const src = script.src || '';
+          if (src.includes('recaptcha') && src.includes('render=')) {
             const match = src.match(/render=([^&]+)/);
-            return match ? match[1] : null;
+            if (match) return match[1];
           }
         }
-        return (window as any).__grecaptcha_render_params?.[0]?.sitekey || null;
+
+        return null;
       });
 
       return result ? { siteKey: result, minScore: 0.9 } : null;
-    } catch {
+    } catch (error) {
+      console.error('[Inquiry CAPTCHA] reCAPTCHA v3 detection error:', error);
       return null;
     }
   }
@@ -150,22 +186,13 @@ export class InquiryCaptchaHandler {
   ): Promise<{ siteKey: string } | null> {
     try {
       const siteKey = await page.evaluate(() => {
-        const container = document.querySelector('[data-sitekey]');
+        const container = document.querySelector('.cf-turnstile');
         return container?.getAttribute('data-sitekey') || null;
       });
 
-      if (siteKey) {
-        // Verify it's Turnstile, not reCAPTCHA
-        const isTurnstile = await page.evaluate(
-          () => !!(window as any).turnstile
-        );
-        if (isTurnstile) {
-          return { siteKey };
-        }
-      }
-
-      return null;
-    } catch {
+      return siteKey ? { siteKey } : null;
+    } catch (error) {
+      console.error('[Inquiry CAPTCHA] Turnstile detection error:', error);
       return null;
     }
   }
@@ -175,18 +202,19 @@ export class InquiryCaptchaHandler {
   ): Promise<{ siteKey: string } | null> {
     try {
       const siteKey = await page.evaluate(() => {
-        const scripts = Array.from(document.querySelectorAll('script'));
-        for (const script of scripts) {
-          if (script.src?.includes('hcaptcha')) {
-            const container = document.querySelector('[data-sitekey]');
-            return container?.getAttribute('data-sitekey') || null;
+        const container = document.querySelector('[data-sitekey]');
+        if (container) {
+          const src = (container.parentElement?.querySelector('script') as any)?.src || '';
+          if (src.includes('hcaptcha')) {
+            return container.getAttribute('data-sitekey');
           }
         }
         return null;
       });
 
       return siteKey ? { siteKey } : null;
-    } catch {
+    } catch (error) {
+      console.error('[Inquiry CAPTCHA] hCaptcha detection error:', error);
       return null;
     }
   }
@@ -207,6 +235,12 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
+      console.log('[Inquiry CAPTCHA] Solving reCAPTCHA v2...');
+      const token = await this.solver.solveRecaptchaV2(pageUrl, captcha.siteKey);
+
+      // Inject token
+      await this.injectRecaptchaV2Token(token);
+
       // Queue the CAPTCHA
       await CaptchaStore.queueCaptcha({
         userId: this.userId,
@@ -215,12 +249,6 @@ export class InquiryCaptchaHandler {
         captchaType: 'reCAPTCHA v2',
         siteKey: captcha.siteKey,
       });
-
-      // Solve it
-      const token = await this.solver.solveRecaptchaV2(pageUrl, captcha.siteKey);
-
-      // Inject into page
-      await this.injectRecaptchaToken(token);
 
       console.log('[Inquiry CAPTCHA] reCAPTCHA v2 solved and injected');
       return { handled: true, status: 'solved', solution: token };
@@ -248,6 +276,16 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
+      console.log('[Inquiry CAPTCHA] Solving reCAPTCHA v3...');
+      const token = await this.solver.solveRecaptchaV3(
+        pageUrl,
+        captcha.siteKey,
+        captcha.minScore
+      );
+
+      // Inject token for v3
+      await this.injectRecaptchaV3Token(token);
+
       // Queue the CAPTCHA
       await CaptchaStore.queueCaptcha({
         userId: this.userId,
@@ -258,15 +296,7 @@ export class InquiryCaptchaHandler {
         minScore: captcha.minScore,
       });
 
-      // Solve it
-      const token = await this.solver.solveRecaptchaV3(
-        pageUrl,
-        captcha.siteKey,
-        captcha.minScore
-      );
-
-      // For v3, the token is typically sent via JavaScript callback
-      console.log('[Inquiry CAPTCHA] reCAPTCHA v3 token obtained');
+      console.log('[Inquiry CAPTCHA] reCAPTCHA v3 solved and injected');
       return { handled: true, status: 'solved', solution: token };
     } catch (error: any) {
       console.error('[Inquiry CAPTCHA] reCAPTCHA v3 solving failed:', error.message);
@@ -292,6 +322,12 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
+      console.log('[Inquiry CAPTCHA] Solving Cloudflare Turnstile...');
+      const token = await this.solver.solveTurnstile(pageUrl, captcha.siteKey);
+
+      // Inject token
+      await this.injectTurnstileToken(token);
+
       // Queue the CAPTCHA
       await CaptchaStore.queueCaptcha({
         userId: this.userId,
@@ -301,13 +337,7 @@ export class InquiryCaptchaHandler {
         websiteKey: captcha.siteKey,
       });
 
-      // Solve it
-      const token = await this.solver.solveTurnstile(pageUrl, captcha.siteKey);
-
-      // Inject into page
-      await this.injectTurnstileToken(token);
-
-      console.log('[Inquiry CAPTCHA] Turnstile solved and injected');
+      console.log('[Inquiry CAPTCHA] Cloudflare Turnstile solved and injected');
       return { handled: true, status: 'solved', solution: token };
     } catch (error: any) {
       console.error('[Inquiry CAPTCHA] Turnstile solving failed:', error.message);
@@ -333,6 +363,12 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
+      console.log('[Inquiry CAPTCHA] Solving hCaptcha...');
+      const token = await this.solver.solveHcaptcha(pageUrl, captcha.siteKey);
+
+      // Inject token
+      await this.injectHcaptchaToken(token);
+
       // Queue the CAPTCHA
       await CaptchaStore.queueCaptcha({
         userId: this.userId,
@@ -341,12 +377,6 @@ export class InquiryCaptchaHandler {
         captchaType: 'hCaptcha',
         siteKey: captcha.siteKey,
       });
-
-      // Solve it
-      const token = await this.solver.solveHcaptcha(pageUrl, captcha.siteKey);
-
-      // Inject into page
-      await this.injectHcaptchaToken(token);
 
       console.log('[Inquiry CAPTCHA] hCaptcha solved and injected');
       return { handled: true, status: 'solved', solution: token };
@@ -360,19 +390,133 @@ export class InquiryCaptchaHandler {
     }
   }
 
-  // Token injection methods
+  // Token injection methods - Based on 2Captcha documentation
 
-  private async injectRecaptchaToken(token: string): Promise<void> {
-    // This is implementation-specific based on how the form uses the token
-    // Typically requires page.evaluate() to inject and trigger submission
-    console.log('[Inquiry CAPTCHA] Token injection not yet implemented');
+  private async injectRecaptchaV2Token(token: string): Promise<void> {
+    try {
+      console.log('[Inquiry CAPTCHA] Injecting reCAPTCHA v2 token...');
+      await this.page.evaluate((token: string) => {
+        // 1. Set the token in the hidden response field
+        const responseField = document.getElementById('g-recaptcha-response');
+        if (responseField) {
+          (responseField as any).value = token;
+          responseField.style.display = 'block';
+        }
+
+        // 2. Call the callback function if it exists
+        if (typeof (window as any).recaptchaCallback === 'function') {
+          (window as any).recaptchaCallback(token);
+        }
+
+        // 3. Alternative: Call grecaptcha callback
+        if ((window as any).grecaptcha) {
+          try {
+            (window as any).grecaptcha?.callback?.(token);
+          } catch (e) {
+            console.log('No grecaptcha callback');
+          }
+        }
+      }, token);
+      console.log('[Inquiry CAPTCHA] reCAPTCHA v2 token injected');
+    } catch (error: any) {
+      console.error('[Inquiry CAPTCHA] Failed to inject reCAPTCHA v2 token:', error.message);
+    }
+  }
+
+  private async injectRecaptchaV3Token(token: string): Promise<void> {
+    try {
+      console.log('[Inquiry CAPTCHA] Injecting reCAPTCHA v3 token...');
+      await this.page.evaluate((token: string) => {
+        // 1. Set token in hidden field
+        const responseField = document.getElementById('g-recaptcha-response');
+        if (responseField) {
+          (responseField as any).value = token;
+        }
+
+        // 2. Call the callback if it exists
+        const callback = (window as any).recaptchaCallback || (window as any).__recaptchaCallback;
+        if (typeof callback === 'function') {
+          callback(token);
+        }
+      }, token);
+      console.log('[Inquiry CAPTCHA] reCAPTCHA v3 token injected');
+    } catch (error: any) {
+      console.error('[Inquiry CAPTCHA] Failed to inject reCAPTCHA v3 token:', error.message);
+    }
   }
 
   private async injectTurnstileToken(token: string): Promise<void> {
-    console.log('[Inquiry CAPTCHA] Token injection not yet implemented');
+    try {
+      console.log('[Inquiry CAPTCHA] Injecting Turnstile token...');
+      await this.page.evaluate((token: string) => {
+        // 1. Set token in the hidden input field
+        let tokenField = document.querySelector(
+          'input[name="cf-turnstile-response"]'
+        ) as any;
+        if (!tokenField) {
+          tokenField = document.querySelector(
+            'input[name="g-recaptcha-response"]'
+          ) as any;
+        }
+        if (tokenField) {
+          tokenField.value = token;
+          tokenField.style.display = 'block';
+        }
+
+        // 2. Call the Turnstile callback if it exists
+        if (typeof (window as any).turnstileCallback === 'function') {
+          (window as any).turnstileCallback(token);
+        }
+
+        // 3. Alternative callback names
+        if (typeof (window as any).__turnstileCallback === 'function') {
+          (window as any).__turnstileCallback(token);
+        }
+      }, token);
+      console.log('[Inquiry CAPTCHA] Turnstile token injected');
+    } catch (error: any) {
+      console.error('[Inquiry CAPTCHA] Failed to inject Turnstile token:', error.message);
+    }
   }
 
   private async injectHcaptchaToken(token: string): Promise<void> {
-    console.log('[Inquiry CAPTCHA] Token injection not yet implemented');
+    try {
+      console.log('[Inquiry CAPTCHA] Injecting hCaptcha token...');
+      await this.page.evaluate((token: string) => {
+        // 1. Set token in hidden field
+        const responseField = document.querySelector(
+          'textarea[name="h-captcha-response"]'
+        ) as any;
+        if (responseField) {
+          responseField.value = token;
+          responseField.style.display = 'block';
+        }
+
+        // Alternative response field name
+        const altField = document.querySelector(
+          'input[name="h-captcha-response"]'
+        ) as any;
+        if (altField) {
+          altField.value = token;
+        }
+
+        // 2. Call the callback if it exists
+        if (typeof (window as any).hcaptchaCallback === 'function') {
+          (window as any).hcaptchaCallback(token);
+        }
+
+        // 3. Call hcaptcha.getResponse()
+        if ((window as any).hcaptcha?.getResponse) {
+          try {
+            (window as any).hcaptcha.getResponse = () => token;
+          } catch (e) {
+            console.log('Could not set hcaptcha.getResponse()');
+          }
+        }
+      }, token);
+      console.log('[Inquiry CAPTCHA] hCaptcha token injected');
+    } catch (error: any) {
+      console.error('[Inquiry CAPTCHA] Failed to inject hCaptcha token:', error.message);
+    }
   }
 }
