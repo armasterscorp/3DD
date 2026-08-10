@@ -1,6 +1,6 @@
 /**
  * 2Captcha Solver - In-Memory Version (No Database)
- * Stores API key in memory during the session
+ * Uses official 2Captcha API endpoints based on their documentation
  */
 
 interface SolveResponse {
@@ -9,18 +9,13 @@ interface SolveResponse {
   error?: string;
 }
 
-interface SolutionResponse {
-  success: boolean;
-  solution?: string;
-  error?: string;
-}
-
 // In-memory storage for API keys per user
 const apiKeyStore = new Map<string, string>();
 
 export class TwoCaptchaSolver {
   private apiKey: string;
-  private baseUrl = 'https://2captcha.com/api';
+  private inUrl = 'https://2captcha.com/in.php'; // Submit captcha
+  private resUrl = 'https://2captcha.com/res.php'; // Get result
   private pollInterval = 2000; // 2 seconds
   private maxAttempts = 30; // 1 minute max wait
 
@@ -33,25 +28,55 @@ export class TwoCaptchaSolver {
    */
   async testConnection(): Promise<{ success: boolean; error?: string }> {
     try {
-      const response = await fetch(`${this.baseUrl}/user`, {
+      console.log('[2Captcha] Testing connection with API key:', this.apiKey.substring(0, 10) + '...');
+      
+      // Test by submitting a dummy text captcha (cheapest operation)
+      const params = new URLSearchParams();
+      params.append('key', this.apiKey);
+      params.append('method', 'post');
+      params.append('captchafile', 'base64:');
+      params.append('json', '1');
+
+      const response = await fetch(this.inUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `apikey=${this.apiKey}&json=1`,
+        body: params.toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
       });
 
-      const data = await response.json();
+      const responseText = await response.text();
+      console.log('[2Captcha] Test response status:', response.status);
+      console.log('[2Captcha] Test response text:', responseText);
 
-      if (data.status === 255) {
-        return { success: false, error: 'Invalid API key' };
+      // Try to parse as JSON
+      try {
+        const data = JSON.parse(responseText);
+        console.log('[2Captcha] Test response JSON:', data);
+
+        // status 0 = error
+        if (data.status === 0) {
+          return { success: false, error: data.error || 'API error' };
+        }
+
+        // status 1 = success (even if we get an error like "ERROR_ZERO_CAPTCHA_FILESIZE")
+        // That just means the image was invalid, but API key works
+        return { success: true };
+      } catch (e) {
+        // Try plain text response format
+        if (responseText.startsWith('ERROR')) {
+          const error = responseText.substring(6).trim();
+          return { success: false, error };
+        }
+        if (responseText.startsWith('OK')) {
+          return { success: true };
+        }
+        // Unknown response format
+        return { success: false, error: `Unknown response format: ${responseText.substring(0, 50)}` };
       }
-
-      if (data.status === 0) {
-        return { success: false, error: data.error || 'API error' };
-      }
-
-      return { success: true };
     } catch (error: any) {
-      return { success: false, error: error.message };
+      console.error('[2Captcha] Connection test error:', error);
+      return { success: false, error: error.message || 'Network error' };
     }
   }
 
@@ -62,11 +87,9 @@ export class TwoCaptchaSolver {
     console.log(`[2Captcha] Solving reCAPTCHA v2 for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
-      method: 'post',
-      captchafile: 'base64:',
-      pageurl: pageUrl,
+      method: 'userrecaptcha',
       googlekey: siteKey,
-      json: 1,
+      pageurl: pageUrl,
     });
 
     if (!response.success) {
@@ -88,14 +111,12 @@ export class TwoCaptchaSolver {
     console.log(`[2Captcha] Solving reCAPTCHA v3 for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
-      method: 'post',
-      captchafile: 'base64:',
-      pageurl: pageUrl,
+      method: 'userrecaptcha',
       googlekey: siteKey,
+      pageurl: pageUrl,
       version: 'v3',
       action: pageAction || '',
       min_score: minScore,
-      json: 1,
     });
 
     if (!response.success) {
@@ -112,12 +133,9 @@ export class TwoCaptchaSolver {
     console.log(`[2Captcha] Solving Turnstile for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
-      method: 'post',
-      captchafile: 'base64:',
+      method: 'turnstile',
+      sitekey: websiteKey,
       pageurl: pageUrl,
-      key: websiteKey,
-      type: 4,
-      json: 1,
     });
 
     if (!response.success) {
@@ -134,12 +152,9 @@ export class TwoCaptchaSolver {
     console.log(`[2Captcha] Solving hCaptcha for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
-      method: 'post',
-      captchafile: 'base64:',
-      pageurl: pageUrl,
+      method: 'hcaptcha',
       sitekey: siteKey,
-      type: 7,
-      json: 1,
+      pageurl: pageUrl,
     });
 
     if (!response.success) {
@@ -159,9 +174,8 @@ export class TwoCaptchaSolver {
     console.log('[2Captcha] Solving image CAPTCHA');
 
     const response = await this.sendCaptcha({
-      method: 'post',
+      method: 'base64',
       captchafile: base64Image,
-      json: 1,
       ...options,
     });
 
@@ -173,12 +187,13 @@ export class TwoCaptchaSolver {
   }
 
   /**
-   * Send captcha to 2Captcha
+   * Send captcha to 2Captcha using their official API
    */
   private async sendCaptcha(params: Record<string, any>): Promise<SolveResponse> {
     try {
       const searchParams = new URLSearchParams();
-      searchParams.append('apikey', this.apiKey);
+      searchParams.append('key', this.apiKey);
+      searchParams.append('json', '1'); // Request JSON response
 
       for (const [key, value] of Object.entries(params)) {
         if (value !== undefined && value !== '') {
@@ -186,21 +201,46 @@ export class TwoCaptchaSolver {
         }
       }
 
-      const response = await fetch(`${this.baseUrl}/captcha`, {
+      console.log('[2Captcha] Sending to:', this.inUrl);
+      const response = await fetch(this.inUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: searchParams.toString(),
       });
 
-      const data = await response.json();
+      const responseText = await response.text();
+      console.log('[2Captcha] Response status:', response.status);
+      console.log('[2Captcha] Response body:', responseText.substring(0, 200));
 
-      if (data.status === 1) {
-        return { success: true, captchaId: data.captcha };
+      // Parse JSON response
+      try {
+        const data = JSON.parse(responseText);
+
+        if (data.status === 1) {
+          return { success: true, captchaId: data.request };
+        }
+
+        if (data.status === 0) {
+          return { success: false, error: data.error || 'Unknown error' };
+        }
+
+        return { success: false, error: 'Invalid response status' };
+      } catch (parseError) {
+        // Handle plain text response
+        if (responseText.startsWith('OK')) {
+          const parts = responseText.split('|');
+          if (parts[1]) {
+            return { success: true, captchaId: parts[1] };
+          }
+        }
+        if (responseText.startsWith('ERROR')) {
+          return { success: false, error: responseText.substring(6).trim() };
+        }
+        return { success: false, error: `Invalid response: ${responseText}` };
       }
-
-      return { success: false, error: data.error || 'Unknown error' };
     } catch (error: any) {
-      return { success: false, error: error.message };
+      console.error('[2Captcha] Send error:', error);
+      return { success: false, error: error.message || 'Network error' };
     }
   }
 
@@ -215,22 +255,48 @@ export class TwoCaptchaSolver {
       attempts++;
 
       try {
-        const response = await fetch(
-          `${this.baseUrl}/result?apikey=${this.apiKey}&captcha=${captchaId}&json=1`
-        );
-        const data = await response.json();
+        const params = new URLSearchParams();
+        params.append('key', this.apiKey);
+        params.append('action', 'get');
+        params.append('id', captchaId);
+        params.append('json', '1');
 
-        if (data.status === 1) {
-          console.log(`[2Captcha] Solution received for captcha ${captchaId}`);
-          return data.request;
-        }
+        const response = await fetch(`${this.resUrl}?${params.toString()}`);
+        const responseText = await response.text();
 
-        if (data.status === 0 && data.request === 'CAPCHA_NOT_READY') {
-          continue;
-        }
+        console.log('[2Captcha] Poll attempt', attempts, '- response:', responseText.substring(0, 100));
 
-        if (data.status === 0) {
-          throw new Error(data.error || 'Solution not available');
+        // Try JSON
+        try {
+          const data = JSON.parse(responseText);
+
+          if (data.status === 1) {
+            console.log(`[2Captcha] Solution received for captcha ${captchaId}`);
+            return data.request;
+          }
+
+          if (data.status === 0 && data.request === 'CAPCHA_NOT_READY') {
+            continue;
+          }
+
+          if (data.status === 0) {
+            throw new Error(data.error || 'Solution not available');
+          }
+        } catch (parseError) {
+          // Handle plain text response
+          if (responseText.startsWith('OK')) {
+            const parts = responseText.split('|');
+            if (parts[1]) {
+              console.log(`[2Captcha] Solution received for captcha ${captchaId}`);
+              return parts[1];
+            }
+          }
+          if (responseText === 'CAPCHA_NOT_READY') {
+            continue;
+          }
+          if (responseText.startsWith('ERROR')) {
+            throw new Error(responseText.substring(6).trim());
+          }
         }
       } catch (error: any) {
         console.error('[2Captcha] Poll error:', error.message);
@@ -246,11 +312,21 @@ export class TwoCaptchaSolver {
    */
   async reportIncorrect(captchaId: string): Promise<boolean> {
     try {
-      const response = await fetch(
-        `${this.baseUrl}/report?apikey=${this.apiKey}&captcha=${captchaId}&action=report&json=1`
-      );
-      const data = await response.json();
-      return data.status === 1;
+      const params = new URLSearchParams();
+      params.append('key', this.apiKey);
+      params.append('action', 'report');
+      params.append('id', captchaId);
+      params.append('json', '1');
+
+      const response = await fetch(`${this.resUrl}?${params.toString()}`);
+      const responseText = await response.text();
+
+      try {
+        const data = JSON.parse(responseText);
+        return data.status === 1;
+      } catch {
+        return responseText.startsWith('OK');
+      }
     } catch (error) {
       return false;
     }
