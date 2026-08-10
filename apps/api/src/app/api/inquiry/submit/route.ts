@@ -108,6 +108,78 @@ async function countVisibleInvalidRequired(form: any): Promise<number> {
 }
 
 
+async function refillEmptyFields(form: any, profile: Record<string, unknown>): Promise<number> {
+  // Re-fills text/email/tel/textarea fields that are empty after a CAPTCHA or page transition.
+  // Uses simple name/placeholder/type heuristics against the session profile.
+  const fields = form.locator('input[type="text"], input[type="email"], input[type="tel"], input:not([type]), textarea');
+  const count = await fields.count().catch(() => 0);
+  let filled = 0;
+
+  const n = (v: unknown): string => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const get = (key: string): string => String((profile as any)[key] || '').trim();
+
+  for (let i = 0; i < count; i += 1) {
+    const field = fields.nth(i);
+    if (!(await field.isVisible().catch(() => false))) continue;
+    const current = String(await field.inputValue().catch(() => '')).trim();
+    if (current) continue; // already filled — skip
+
+    const attrs = await field.evaluate((el: any) => ({
+      name: el.getAttribute('name') || '',
+      id: el.getAttribute('id') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      autocomplete: el.getAttribute('autocomplete') || '',
+      type: el.getAttribute('type') || el.tagName.toLowerCase(),
+    })).catch(() => ({ name: '', id: '', placeholder: '', autocomplete: '', type: '' }));
+
+    const sig = n(`${attrs.name} ${attrs.id} ${attrs.placeholder} ${attrs.autocomplete}`);
+    const type = n(attrs.type);
+
+    let value = '';
+    if (type === 'email' || /email|courriel/.test(sig)) {
+      value = get('email');
+    } else if (type === 'tel' || /phone|telephone|mobile|cell/.test(sig)) {
+      value = get('phone');
+    } else if (/first.?name|prenom|given.?name|fname/.test(sig)) {
+      value = get('firstName');
+    } else if (/last.?name|nom.de.famille|family.?name|lname|surname/.test(sig)) {
+      value = get('lastName');
+    } else if (/\bname\b|full.?name|nom/.test(sig) && !/company|firm|organization/.test(sig)) {
+      value = get('firstName') && get('lastName') ? `${get('firstName')} ${get('lastName')}` : get('firstName') || get('lastName');
+    } else if (/company|firm|organization|organisation/.test(sig)) {
+      value = get('company');
+    } else if (/subject|objet/.test(sig)) {
+      value = get('subject');
+    } else if (/message|comment|details|description|inquiry|request|body/.test(sig)) {
+      value = get('message');
+    } else if (/address|adresse/.test(sig) && !/email/.test(sig)) {
+      value = get('address');
+    } else if (/\bcity\b|\bville\b/.test(sig)) {
+      value = get('city');
+    } else if (/state|province|region/.test(sig)) {
+      value = get('state');
+    } else if (/zip|postal|postcode/.test(sig)) {
+      value = get('postalCode');
+    }
+
+    if (value) {
+      try {
+        await field.fill(value);
+      } catch {
+        await field.evaluate((el: any, v: string) => {
+          const setter = Object.getOwnPropertyDescriptor(el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(el, v); else el.value = v;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, value).catch(() => undefined);
+      }
+      const check = String(await field.inputValue().catch(() => '')).trim();
+      if (check) filled += 1;
+    }
+  }
+  return filled;
+}
+
 async function getFormFillState(form: any): Promise<{ filled: number; total: number }> {
   const fields = form.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]), textarea, select');
   const count = await fields.count().catch(() => 0);
@@ -292,12 +364,14 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     const titleAttr = String(await frame.getAttribute('title').catch(() => '') || '');
 
     if (box.width >= 160 && box.height >= 45) {
+      const combined = `${src} ${titleAttr}`;
       return {
         detected: true,
         provider:
-          /hcaptcha/i.test(`${src} ${titleAttr}`) ? 'hCaptcha' :
-          /cloudflare|turnstile/i.test(`${src} ${titleAttr}`) ? 'Cloudflare Turnstile' :
-          'reCAPTCHA',
+          /recaptcha/i.test(combined) ? 'reCAPTCHA' :
+          /hcaptcha/i.test(combined) ? 'hCaptcha' :
+          /cloudflare|turnstile/i.test(combined) ? 'Cloudflare Turnstile' :
+          'Unknown CAPTCHA / Human Verification',
       };
     }
   }
@@ -401,15 +475,14 @@ export async function POST(request: NextRequest) {
       const overlayState = await handleBlockingOverlays(page);
       if (overlayState.reviewRequired) return saveReview(overlayState.reviewRequired);
 
-      await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission');
+      await solveCaptchaWithTimeout(`attempting to solve CAPTCHA before form submission on ${page.url()}`);
       const captcha = await detectCaptcha(page, chosen);
       if (captcha.detected) {
-        addInquiryLog({
-          licenseId,
-          runId,
-          level: 'warning',
-          message: `⚠ CAPTCHA still detected (${captcha.provider || 'CAPTCHA'}), continuing submission attempt`,
-        });
+        // CAPTCHA still present after automated solve attempt — classify and skip quickly.
+        const provider = captcha.provider || 'Unknown CAPTCHA / Human Verification';
+        addInquiryLog({ licenseId, runId, level: 'warning', message: `CAPTCHA unresolved before submission on ${page.url()} (${provider}) — skipping target` });
+        const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: provider, reason: `CAPTCHA detected before submission (auto-solve failed): ${provider}`, values: session.profile || {} });
+        return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: provider, error: `CAPTCHA could not be solved automatically`, resultId: result.id, steps }, { status: 409 });
       }
 
       const submit = await findSubmitControl(chosen);
@@ -458,12 +531,67 @@ export async function POST(request: NextRequest) {
       const isIntermediate = /\b(next|continue|review|preview|suivant|continuer|poursuivre|reviser|aperçu|apercu)\b/i.test(label) && !/\b(send|submit|finish|complete|request|apply|envoyer|soumettre|terminer|finaliser)\b/i.test(label);
       if (!isIntermediate) {
         await page.waitForTimeout(1200);
-        if (captchaHandler) {
-          const postSubmitCaptcha = await captchaHandler.checkPostSubmitCaptcha(page);
-          if (postSubmitCaptcha.detected) {
-            await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve');
+
+        // Check for post-submit CAPTCHA using the same strict detector.
+        const postSubmitCaptchaDetection = await detectCaptcha(page, page.locator('body'));
+        if (postSubmitCaptchaDetection.detected) {
+          const captchaUrl = page.url();
+          const provider = postSubmitCaptchaDetection.provider || 'Unknown CAPTCHA / Human Verification';
+          addInquiryLog({ licenseId, runId, level: 'info', message: `post-submit CAPTCHA detected on ${captchaUrl} (${provider}) — attempting automated solve` });
+
+          const solveResult = await solveCaptchaWithTimeout(`post-submit CAPTCHA on ${captchaUrl}`);
+          if (solveResult.status === 'solved') {
+            // CAPTCHA solved — re-discover active form/controls, re-validate, refill missing fields, retry submit.
+            addInquiryLog({ licenseId, runId, level: 'info', message: `CAPTCHA solved — re-discovering form and re-validating fields on ${page.url()}` });
+            await page.waitForTimeout(600);
+            const resumeForm = await findBestForm(page);
+            if (resumeForm) {
+              await checkRequiredPrivacyConsents(resumeForm);
+              const refilled = await refillEmptyFields(resumeForm, session.profile || {});
+              if (refilled > 0) {
+                addInquiryLog({ licenseId, runId, level: 'info', message: `refilled ${refilled} field(s) cleared by CAPTCHA interaction` });
+              }
+              const resumeSubmit = await findSubmitControl(resumeForm);
+              if (resumeSubmit) {
+                addInquiryLog({ licenseId, runId, level: 'info', message: `retrying submission after CAPTCHA solve on ${page.url()}` });
+                const resumeBeforeUrl = String(page.url?.() || '');
+                const resumeBeforeText = String(await page.locator('body').innerText().catch(() => ''));
+                const resumeFillState = await getFormFillState(resumeForm);
+                await resumeSubmit.scrollIntoViewIfNeeded().catch(() => undefined);
+                await visualSubmitPause(page, 500);
+                try {
+                  await resumeSubmit.click({ timeout: 5000 });
+                } catch {
+                  await resumeSubmit.click({ force: true, timeout: 3500 }).catch(() => undefined);
+                }
+                await visualSubmitPause(page, 700);
+                const resumeOutcome = await detectSubmissionOutcome(page, resumeBeforeUrl, resumeBeforeText, resumeFillState.filled);
+                if (resumeOutcome.status === 'captcha') {
+                  // Still captcha after retry — classify and skip.
+                  const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: resumeOutcome.captchaProvider || provider, reason: resumeOutcome.reason, values: session.profile || {} });
+                  addInquiryLog({ licenseId, runId, level: 'warning', message: `CAPTCHA unresolved after retry on ${page.url()} (${resumeOutcome.captchaProvider || provider}) — skipping target` });
+                  return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: resumeOutcome.captchaProvider || provider, error: resumeOutcome.reason, resultId: result.id, steps }, { status: 409 });
+                }
+                if (resumeOutcome.status === 'review') return saveReview(resumeOutcome.reason);
+                const result = addInquiryResult({ licenseId, runId, sessionId, status: 'submitted', target, contactUrl: page.url(), reason: resumeOutcome.reason, values: session.profile || {} });
+                addInquiryLog({ licenseId, runId, level: 'success', message: `form submitted successfully after CAPTCHA solve on ${page.url()}` });
+                return NextResponse.json({
+                  success: true, confirmed: true, confirmation: resumeOutcome.reason, currentUrl: page.url(),
+                  submitLabel: label, steps, submittedValues: session.profile || {}, resultId: result.id,
+                  message: `Form submission confirmed after CAPTCHA solve: ${steps.join(' -> ')}`,
+                });
+              }
+            }
+            // Resume form or submit button not found after solve — treat as review.
+            return saveReview('Manual review required: could not re-locate form or submit control after CAPTCHA solve.');
+          } else {
+            // Auto-solve failed — classify and skip quickly, do not block pipeline.
+            addInquiryLog({ licenseId, runId, level: 'warning', message: `post-submit CAPTCHA unresolved on ${captchaUrl} (${provider}) — skipping target` });
+            const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: captchaUrl, captchaProvider: provider, reason: `post-submit CAPTCHA (auto-solve failed): ${provider}`, values: session.profile || {} });
+            return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: provider, error: `post-submit CAPTCHA could not be solved automatically`, resultId: result.id, steps }, { status: 409 });
           }
         }
+
         // A button label alone is not proof that the form was submitted. Wait
         // for an explicit success/confirmation state. If the site reveals
         // another section or gives no reliable confirmation, keep it for
@@ -471,6 +599,7 @@ export async function POST(request: NextRequest) {
         const outcome = await detectSubmissionOutcome(page, beforeUrl, beforeText, beforeFillState.filled);
         if (outcome.status === 'captcha') {
           const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: outcome.captchaProvider || 'CAPTCHA', reason: outcome.reason, values: session.profile || {} });
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `CAPTCHA detected during submission outcome check on ${page.url()} (${outcome.captchaProvider || 'CAPTCHA'}) — skipping target` });
           return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: outcome.captchaProvider || 'CAPTCHA', error: outcome.reason, resultId: result.id, steps }, { status: 409 });
         }
         if (outcome.status === 'review') return saveReview(outcome.reason);

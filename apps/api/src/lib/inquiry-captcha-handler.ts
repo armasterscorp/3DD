@@ -86,7 +86,7 @@ export class InquiryCaptchaHandler {
   }
 
   /**
-   * Check for CAPTCHA after form submission
+   * Check for CAPTCHA after form submission using strict provider signals
    */
   async checkPostSubmitCaptcha(page: any): Promise<{
     detected: boolean;
@@ -95,20 +95,36 @@ export class InquiryCaptchaHandler {
     try {
       this.page = page;
 
-      // Check for Turnstile
+      // Check for Cloudflare Turnstile (strict: requires turnstile-specific signals)
       const hasTurnstile = await page.evaluate(
-        () => !!(window as any).turnstile && document.querySelector('.cf-turnstile')
+        () => !!(window as any).turnstile && !!document.querySelector('.cf-turnstile')
       );
       if (hasTurnstile) {
-        return { detected: true, type: 'turnstile' };
+        return { detected: true, type: 'Cloudflare Turnstile' };
       }
 
-      // Check for reCAPTCHA
-      const hasRecaptcha = await page.evaluate(
-        () => !!(window as any).grecaptcha || document.querySelector('[data-sitekey]')
+      // Check for hCaptcha (strict: requires hcaptcha-specific signals)
+      const hasHcaptcha = await page.evaluate(
+        () => !!(window as any).hcaptcha || !!document.querySelector('[data-hcaptcha-widget-id], iframe[src*="hcaptcha"]')
       );
+      if (hasHcaptcha) {
+        return { detected: true, type: 'hCaptcha' };
+      }
 
-      return { detected: hasRecaptcha, type: 'recaptcha' };
+      // Check for reCAPTCHA (strict: requires Google recaptcha-specific signals)
+      const hasRecaptcha = await page.evaluate(
+        () => {
+          const hasGreCaptcha = !!(window as any).grecaptcha;
+          const hasRecaptchaFrame = !!document.querySelector('iframe[src*="recaptcha"]');
+          const hasRecaptchaTextarea = !!document.querySelector('textarea[name="g-recaptcha-response"]');
+          return hasGreCaptcha || hasRecaptchaFrame || hasRecaptchaTextarea;
+        }
+      );
+      if (hasRecaptcha) {
+        return { detected: true, type: 'reCAPTCHA' };
+      }
+
+      return { detected: false };
     } catch {
       return { detected: false };
     }
