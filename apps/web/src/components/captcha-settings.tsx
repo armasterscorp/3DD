@@ -41,7 +41,7 @@ export function CaptchaSettings() {
     setSuccess(null);
 
     try {
-      const response = await axios.post('/api/captcha/config', {
+      await axios.post('/api/captcha/config', {
         apiKey: apiKey.trim(),
       });
 

@@ -41,6 +41,7 @@ async function proxyRequest(
   // Useful for API logs/debugging. This is not a secret and is never trusted
   // as a replacement for the web-side Ed25519 verification.
   requestHeaders.set('x-3d-suite-license-id', license.licenseId);
+  requestHeaders.set('x-user-id', license.licenseId);
 
   const shouldIncludeBody =
     request.method !== 'GET' && request.method !== 'HEAD';
