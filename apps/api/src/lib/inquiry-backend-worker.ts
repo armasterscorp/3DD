@@ -2,7 +2,9 @@ import { NextRequest } from 'next/server';
 import { POST as prepareInquiry } from '@/app/api/inquiry/prepare/route';
 import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
 import { addInquiryLog, addInquiryResult, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError, setInquiryRunState } from '@/lib/inquiry-run-store';
-import { closeInquirySession } from '@/lib/inquiry-browser-store';
+import { closeInquirySession, getInquirySession } from '@/lib/inquiry-browser-store';
+import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
+import { getUserApiKey } from '@/lib/captcha-solver';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -181,6 +183,27 @@ export function startInquiryBackendWorker(args: {
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}` });
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}` });
             await inquiryCheckpoint(args.licenseId);
+
+            // Attempt automatic CAPTCHA solving before form submission
+            try {
+              const apiKey = getUserApiKey(args.licenseId);
+              if (apiKey) {
+                const session = await getInquirySession(args.sessionId, args.licenseId);
+                if (session?.page) {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — checking for CAPTCHA before submission on ${target}` });
+                  const captchaHandler = new InquiryCaptchaHandler(args.licenseId, args.runId, apiKey);
+                  const captchaResult = await captchaHandler.handleCaptcha(session.page);
+                  if (captchaResult.status === 'solved') {
+                    addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — CAPTCHA solved automatically on ${target}` });
+                  } else if (captchaResult.status === 'failed') {
+                    addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA solving failed on ${target}: ${captchaResult.error || 'unknown error'}; continuing with submission` });
+                  }
+                }
+              }
+            } catch (captchaError) {
+              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA handler error on ${target}: ${captchaError instanceof Error ? captchaError.message : String(captchaError)}; continuing with submission` });
+            }
+
             let submitResponse: Response;
             try {
               submitResponse = await withTargetWatchdog({
