@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { TwoCaptchaSolver } from '@/lib/captcha-solver';
+import {
+  resolveUserApiKey,
+  setUserApiKey,
+  TwoCaptchaSolver,
+} from '@/lib/captcha-solver';
 import { CaptchaStore } from '@/lib/captcha-store';
 
 /**
@@ -17,7 +21,8 @@ export async function GET(request: NextRequest) {
     }
 
     const config = await CaptchaStore.getCaptchaConfig(userId);
-    if (!config) {
+    const effectiveApiKey = await resolveUserApiKey(userId);
+    if (!config && !effectiveApiKey) {
       return NextResponse.json(
         { configured: false, isActive: false },
         { status: 200 }
@@ -26,10 +31,11 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({
       configured: true,
-      isActive: config.isActive,
-      lastTestAt: config.lastTestAt,
-      lastTestStatus: config.lastTestStatus,
-      testError: config.testError,
+      isActive: config?.isActive ?? true,
+      lastTestAt: config?.lastTestAt,
+      lastTestStatus: config?.lastTestStatus || 'success',
+      testError: config?.testError,
+      source: config?.apiKey ? 'dashboard' : 'environment',
     });
   } catch (error: any) {
     console.error('[Captcha Config] GET error:', error.message);
@@ -80,6 +86,7 @@ export async function POST(request: NextRequest) {
 
     // Save config
     const config = await CaptchaStore.saveCaptchaConfig(userId, apiKey);
+    setUserApiKey(userId, apiKey);
     await CaptchaStore.updateTestStatus(userId, 'success');
 
     return NextResponse.json({

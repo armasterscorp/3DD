@@ -235,19 +235,27 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
-      console.log('[Inquiry CAPTCHA] Solving reCAPTCHA v2...');
-      const token = await this.solver.solveRecaptchaV2(pageUrl, captcha.siteKey);
-
-      // Inject token
-      await this.injectRecaptchaV2Token(token);
-
-      // Queue the CAPTCHA
-      await CaptchaStore.queueCaptcha({
+      const queued = await CaptchaStore.queueCaptcha({
         userId: this.userId,
         inquiryRunId: this.runId,
         targetUrl: pageUrl,
         captchaType: 'reCAPTCHA v2',
         siteKey: captcha.siteKey,
+      });
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solving',
+        attempts: 1,
+      });
+
+      console.log('[Inquiry CAPTCHA] Solving reCAPTCHA v2...');
+      const token = await this.solver.solveRecaptchaV2(pageUrl, captcha.siteKey);
+
+      // Inject token
+      await this.injectRecaptchaV2Token(token);
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solved',
+        solvedAt: new Date(),
+        attempts: 1,
       });
 
       console.log('[Inquiry CAPTCHA] reCAPTCHA v2 solved and injected');
@@ -276,6 +284,19 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
+      const queued = await CaptchaStore.queueCaptcha({
+        userId: this.userId,
+        inquiryRunId: this.runId,
+        targetUrl: pageUrl,
+        captchaType: 'reCAPTCHA v3',
+        siteKey: captcha.siteKey,
+        minScore: captcha.minScore,
+      });
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solving',
+        attempts: 1,
+      });
+
       console.log('[Inquiry CAPTCHA] Solving reCAPTCHA v3...');
       const token = await this.solver.solveRecaptchaV3(
         pageUrl,
@@ -285,15 +306,10 @@ export class InquiryCaptchaHandler {
 
       // Inject token for v3
       await this.injectRecaptchaV3Token(token);
-
-      // Queue the CAPTCHA
-      await CaptchaStore.queueCaptcha({
-        userId: this.userId,
-        inquiryRunId: this.runId,
-        targetUrl: pageUrl,
-        captchaType: 'reCAPTCHA v3',
-        siteKey: captcha.siteKey,
-        minScore: captcha.minScore,
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solved',
+        solvedAt: new Date(),
+        attempts: 1,
       });
 
       console.log('[Inquiry CAPTCHA] reCAPTCHA v3 solved and injected');
@@ -322,19 +338,27 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
-      console.log('[Inquiry CAPTCHA] Solving Cloudflare Turnstile...');
-      const token = await this.solver.solveTurnstile(pageUrl, captcha.siteKey);
-
-      // Inject token
-      await this.injectTurnstileToken(token);
-
-      // Queue the CAPTCHA
-      await CaptchaStore.queueCaptcha({
+      const queued = await CaptchaStore.queueCaptcha({
         userId: this.userId,
         inquiryRunId: this.runId,
         targetUrl: pageUrl,
         captchaType: 'Cloudflare Turnstile',
         websiteKey: captcha.siteKey,
+      });
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solving',
+        attempts: 1,
+      });
+
+      console.log('[Inquiry CAPTCHA] Solving Cloudflare Turnstile...');
+      const token = await this.solver.solveTurnstile(pageUrl, captcha.siteKey);
+
+      // Inject token
+      await this.injectTurnstileToken(token);
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solved',
+        solvedAt: new Date(),
+        attempts: 1,
       });
 
       console.log('[Inquiry CAPTCHA] Cloudflare Turnstile solved and injected');
@@ -363,19 +387,27 @@ export class InquiryCaptchaHandler {
         throw new Error('Solver not configured');
       }
 
-      console.log('[Inquiry CAPTCHA] Solving hCaptcha...');
-      const token = await this.solver.solveHcaptcha(pageUrl, captcha.siteKey);
-
-      // Inject token
-      await this.injectHcaptchaToken(token);
-
-      // Queue the CAPTCHA
-      await CaptchaStore.queueCaptcha({
+      const queued = await CaptchaStore.queueCaptcha({
         userId: this.userId,
         inquiryRunId: this.runId,
         targetUrl: pageUrl,
         captchaType: 'hCaptcha',
         siteKey: captcha.siteKey,
+      });
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solving',
+        attempts: 1,
+      });
+
+      console.log('[Inquiry CAPTCHA] Solving hCaptcha...');
+      const token = await this.solver.solveHcaptcha(pageUrl, captcha.siteKey);
+
+      // Inject token
+      await this.injectHcaptchaToken(token);
+      await CaptchaStore.updateCaptchaQueue(queued.id, {
+        status: 'solved',
+        solvedAt: new Date(),
+        attempts: 1,
       });
 
       console.log('[Inquiry CAPTCHA] hCaptcha solved and injected');
@@ -392,16 +424,77 @@ export class InquiryCaptchaHandler {
 
   // Token injection methods - Based on 2Captcha documentation
 
+  private async markCaptchaSolved(provider: string): Promise<void> {
+    try {
+      await this.page.evaluate((provider: string) => {
+        document.documentElement.setAttribute(
+          'data-3d-suite-captcha-solved-at',
+          String(Date.now())
+        );
+        document.documentElement.setAttribute(
+          'data-3d-suite-captcha-provider',
+          provider
+        );
+        document.body.setAttribute(
+          'data-3d-suite-captcha-solved-at',
+          String(Date.now())
+        );
+      }, provider);
+    } catch {}
+  }
+
+  private async ensureResponseField(
+    selectors: string[],
+    name: string,
+    token: string
+  ): Promise<void> {
+    await this.page.evaluate(
+      (args: { selectors: string[]; name: string; token: string }) => {
+        const dispatchUpdates = (node: HTMLInputElement | HTMLTextAreaElement) => {
+          node.value = args.token;
+          node.textContent = args.token;
+          node.dispatchEvent(new Event('input', { bubbles: true }));
+          node.dispatchEvent(new Event('change', { bubbles: true }));
+          node.dispatchEvent(new Event('blur', { bubbles: true }));
+        };
+
+        for (const selector of args.selectors) {
+          const existing = document.querySelector(
+            selector
+          ) as HTMLInputElement | HTMLTextAreaElement | null;
+          if (existing) {
+            dispatchUpdates(existing);
+            return;
+          }
+        }
+
+        const created = document.createElement('textarea');
+        created.name = args.name;
+        if (args.name === 'g-recaptcha-response') created.id = 'g-recaptcha-response';
+        created.style.display = 'none';
+        dispatchUpdates(created);
+        const form = document.querySelector('form') || document.body;
+        form.appendChild(created);
+      },
+      { selectors, name, token }
+    );
+  }
+
   private async injectRecaptchaV2Token(token: string): Promise<void> {
     try {
       console.log('[Inquiry CAPTCHA] Injecting reCAPTCHA v2 token...');
+      await this.ensureResponseField(
+        [
+          '#g-recaptcha-response',
+          'textarea[name="g-recaptcha-response"]',
+          'input[name="g-recaptcha-response"]',
+        ],
+        'g-recaptcha-response',
+        token
+      );
       await this.page.evaluate((token: string) => {
-        // 1. Set the token in the hidden response field
         const responseField = document.getElementById('g-recaptcha-response');
-        if (responseField) {
-          (responseField as any).value = token;
-          responseField.style.display = 'block';
-        }
+        if (responseField) responseField.style.display = 'block';
 
         // 2. Call the callback function if it exists
         if (typeof (window as any).recaptchaCallback === 'function') {
@@ -417,6 +510,7 @@ export class InquiryCaptchaHandler {
           }
         }
       }, token);
+      await this.markCaptchaSolved('recaptcha');
       console.log('[Inquiry CAPTCHA] reCAPTCHA v2 token injected');
     } catch (error: any) {
       console.error('[Inquiry CAPTCHA] Failed to inject reCAPTCHA v2 token:', error.message);
@@ -426,19 +520,24 @@ export class InquiryCaptchaHandler {
   private async injectRecaptchaV3Token(token: string): Promise<void> {
     try {
       console.log('[Inquiry CAPTCHA] Injecting reCAPTCHA v3 token...');
+      await this.ensureResponseField(
+        [
+          '#g-recaptcha-response',
+          'textarea[name="g-recaptcha-response"]',
+          'input[name="g-recaptcha-response"]',
+        ],
+        'g-recaptcha-response',
+        token
+      );
       await this.page.evaluate((token: string) => {
-        // 1. Set token in hidden field
         const responseField = document.getElementById('g-recaptcha-response');
-        if (responseField) {
-          (responseField as any).value = token;
-        }
-
-        // 2. Call the callback if it exists
+        if (responseField) (responseField as any).value = token;
         const callback = (window as any).recaptchaCallback || (window as any).__recaptchaCallback;
         if (typeof callback === 'function') {
           callback(token);
         }
       }, token);
+      await this.markCaptchaSolved('recaptcha');
       console.log('[Inquiry CAPTCHA] reCAPTCHA v3 token injected');
     } catch (error: any) {
       console.error('[Inquiry CAPTCHA] Failed to inject reCAPTCHA v3 token:', error.message);
@@ -448,8 +547,17 @@ export class InquiryCaptchaHandler {
   private async injectTurnstileToken(token: string): Promise<void> {
     try {
       console.log('[Inquiry CAPTCHA] Injecting Turnstile token...');
+      await this.ensureResponseField(
+        [
+          'input[name="cf-turnstile-response"]',
+          'textarea[name="cf-turnstile-response"]',
+          'input[name="g-recaptcha-response"]',
+          'textarea[name="g-recaptcha-response"]',
+        ],
+        'cf-turnstile-response',
+        token
+      );
       await this.page.evaluate((token: string) => {
-        // 1. Set token in the hidden input field
         let tokenField = document.querySelector(
           'input[name="cf-turnstile-response"]'
         ) as any;
@@ -473,6 +581,7 @@ export class InquiryCaptchaHandler {
           (window as any).__turnstileCallback(token);
         }
       }, token);
+      await this.markCaptchaSolved('turnstile');
       console.log('[Inquiry CAPTCHA] Turnstile token injected');
     } catch (error: any) {
       console.error('[Inquiry CAPTCHA] Failed to inject Turnstile token:', error.message);
@@ -482,8 +591,15 @@ export class InquiryCaptchaHandler {
   private async injectHcaptchaToken(token: string): Promise<void> {
     try {
       console.log('[Inquiry CAPTCHA] Injecting hCaptcha token...');
+      await this.ensureResponseField(
+        [
+          'textarea[name="h-captcha-response"]',
+          'input[name="h-captcha-response"]',
+        ],
+        'h-captcha-response',
+        token
+      );
       await this.page.evaluate((token: string) => {
-        // 1. Set token in hidden field
         const responseField = document.querySelector(
           'textarea[name="h-captcha-response"]'
         ) as any;
@@ -514,6 +630,7 @@ export class InquiryCaptchaHandler {
           }
         }
       }, token);
+      await this.markCaptchaSolved('hcaptcha');
       console.log('[Inquiry CAPTCHA] hCaptcha token injected');
     } catch (error: any) {
       console.error('[Inquiry CAPTCHA] Failed to inject hCaptcha token:', error.message);

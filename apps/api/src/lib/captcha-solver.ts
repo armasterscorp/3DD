@@ -3,6 +3,13 @@
  * Uses official 2Captcha API endpoints based on their documentation
  */
 
+import { CaptchaStore } from './captcha-store';
+import {
+  extractCaptchaProviderError,
+  getCaptchaApiKeyFromEnv,
+  maskSecret,
+} from './inquiry-captcha-utils';
+
 interface SolveResponse {
   success: boolean;
   captchaId?: string;
@@ -33,7 +40,7 @@ export class TwoCaptchaSolver {
    */
   async testConnection(): Promise<{ success: boolean; error?: string }> {
     try {
-      console.log('[2Captcha] Testing connection with API key:', this.apiKey.substring(0, 10) + '...');
+      console.log('[2Captcha] Testing connection with API key:', maskSecret(this.apiKey));
       
       // Test with a simple text captcha (cheapest and simplest)
       const params = new URLSearchParams();
@@ -56,7 +63,7 @@ export class TwoCaptchaSolver {
 
       try {
         const data = JSON.parse(responseText);
-        console.log('[2Captcha] Test response JSON:', data);
+        console.log('[2Captcha] Test response JSON status:', data?.status);
 
         // Status 1 = success (captcha was accepted)
         if (data.status === 1) {
@@ -261,7 +268,10 @@ export class TwoCaptchaSolver {
         }
 
         if (data.status === 0) {
-          return { success: false, error: data.error || 'Unknown error' };
+          return {
+            success: false,
+            error: extractCaptchaProviderError(data, 'Unknown error'),
+          };
         }
 
         return { success: false, error: 'Invalid response status' };
@@ -320,7 +330,9 @@ export class TwoCaptchaSolver {
           }
 
           if (data.status === 0) {
-            throw new Error(data.error || 'Solution not available');
+            throw new Error(
+              extractCaptchaProviderError(data, 'Solution not available')
+            );
           }
         } catch (parseError) {
           // Handle plain text response
@@ -377,7 +389,12 @@ export class TwoCaptchaSolver {
  * Store API key in memory for a user
  */
 export function setUserApiKey(userId: string, apiKey: string): void {
-  apiKeyStore.set(userId, apiKey);
+  const value = apiKey.trim();
+  if (!value) {
+    apiKeyStore.delete(userId);
+    return;
+  }
+  apiKeyStore.set(userId, value);
   console.log(`[2Captcha] API key stored for user ${userId}`);
 }
 
@@ -385,7 +402,21 @@ export function setUserApiKey(userId: string, apiKey: string): void {
  * Get stored API key for a user
  */
 export function getUserApiKey(userId: string): string | null {
-  return apiKeyStore.get(userId) || null;
+  return apiKeyStore.get(userId) || getCaptchaApiKeyFromEnv();
+}
+
+export async function resolveUserApiKey(userId: string): Promise<string | null> {
+  const direct = apiKeyStore.get(userId);
+  if (direct) return direct;
+
+  const config = await CaptchaStore.getCaptchaConfig(userId);
+  const stored = String(config?.apiKey || '').trim();
+  if (stored && config?.isActive !== false) {
+    apiKeyStore.set(userId, stored);
+    return stored;
+  }
+
+  return getCaptchaApiKeyFromEnv();
 }
 
 /**
