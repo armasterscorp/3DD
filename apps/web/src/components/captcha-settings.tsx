@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import axios from 'axios';
 
 interface CaptchaConfig {
@@ -18,14 +18,38 @@ export function CaptchaSettings() {
   const [config, setConfig] = useState<CaptchaConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string>('test-user');
+
+  // Initialize axios with x-user-id header
+  useEffect(() => {
+    // Set default userId from localStorage or use test-user
+    const storedUserId = localStorage.getItem('userId') || 'test-user';
+    setUserId(storedUserId);
+
+    // Configure axios to include x-user-id header in all requests
+    axios.interceptors.request.use((config) => {
+      config.headers['x-user-id'] = storedUserId;
+      return config;
+    });
+
+    // Load config on mount
+    loadConfig();
+  }, []);
 
   // Load current config
   const loadConfig = async () => {
     try {
-      const response = await axios.get('/api/captcha/config');
+      const response = await axios.get('/api/captcha/config', {
+        headers: {
+          'x-user-id': userId || 'test-user',
+        },
+      });
       setConfig(response.data);
     } catch (err: any) {
       console.error('Failed to load config:', err);
+      if (err.response?.status === 401) {
+        setError('Unauthorized - User ID not found');
+      }
     }
   };
 
@@ -41,15 +65,24 @@ export function CaptchaSettings() {
     setSuccess(null);
 
     try {
-      await axios.post('/api/captcha/config', {
-        apiKey: apiKey.trim(),
-      });
+      const response = await axios.post(
+        '/api/captcha/config',
+        {
+          apiKey: apiKey.trim(),
+        },
+        {
+          headers: {
+            'x-user-id': userId || 'test-user',
+          },
+        }
+      );
 
       setSuccess('✓ 2Captcha API key saved and tested successfully');
       setApiKey('');
       await loadConfig();
     } catch (err: any) {
       const msg = err.response?.data?.error || err.message || 'Failed to save API key';
+      console.error('Save API key error:', err.response?.data);
       setError(`✗ ${msg}`);
     } finally {
       setLoading(false);
