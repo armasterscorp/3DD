@@ -1,0 +1,18 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install dependencies
+COPY package*.json ./
+RUN npm ci
+
+# Copy packages
+COPY packages ./packages
+COPY apps/api ./apps/api
+
+# Build
+RUN npm run build --workspace=@3d-suite/api
+RUN npm run build --workspace=@3d-suite/db
+
+# Run queue processor
+CMD ["node", "apps/api/dist/queue/processor.js"]

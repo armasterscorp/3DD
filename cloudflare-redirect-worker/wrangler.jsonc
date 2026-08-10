@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "3d-suite-redirector",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-19",
+  "kv_namespaces": [
+    {
+      "binding": "REDIRECTS",
+      "id": "4d337200b9c04eaa9f07abdbf940a654"
+    }
+  ]
+}

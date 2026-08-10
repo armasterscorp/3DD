@@ -1,0 +1,20 @@
+3D Suite Inquiry — Email/Name Autofill Restoration
+
+Changes:
+- Restores aggressive autofill for Email and Name fields, including compact/custom names such as contactform_email.
+- Recognizes First/Last, First Name/Last Name, Given/Surname, Full Name/Contact Name and related variants.
+- Uses reliable input/change event dispatch fallback for controlled form fields.
+- Deduplicates and shortens manual required-field labels.
+- Keeps existing automatic CAPTCHA classification and skipping.
+- Keeps existing SITE_UNAVAILABLE classification for DNS/timeouts/resets/aborts.
+- Keeps existing NO_FORM classification and automatic skipping.
+- Does not bypass or solve CAPTCHA.
+
+Install:
+1. Extract this ZIP into your 3D Suite project root and replace matching files.
+2. Clear caches:
+   Remove-Item -Recurse -Force apps\web\.next -ErrorAction SilentlyContinue
+   Remove-Item -Recurse -Force apps\api\.next -ErrorAction SilentlyContinue
+3. Run: npm run dev
+
+Update: Unmatched select fields now use the first usable non-placeholder option. Inquiry screenshots can be toggled on/off from the dashboard; browser automation continues even when screenshots are hidden.

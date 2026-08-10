@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaigns Campaign[]
+
+  @@map("users")
+}
+
+model Campaign {
+  id              String   @id @default(cuid())
+  userId          String
+  name            String
+  description     String?
+  templatePdfUrl  String   // URL to uploaded template PDF
+  placeholders    String[] // JSON array of placeholder names
+  status          String   @default("draft") // draft, active, completed, paused
+  totalLeads      Int      @default(0)
+  processedLeads  Int      @default(0)
+  failedLeads     Int      @default(0)
+  successLeads    Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  leads  Lead[]
+  logs   CampaignLog[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("campaigns")
+}
+
+model Lead {
+  id              String   @id @default(cuid())
+  campaignId      String
+  email           String
+  name            String
+  company         String?
+  referenceNumber String?
+  customFields    Json? // Flexible JSON for custom lead data
+  status          String   @default("pending") // pending, processing, sent, failed
+  weTransferId    String? // WeTransfer link/ID
+  tempEmail       String? // Temporary email used
+  errorMessage    String?
+  sentAt          DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+  @@index([status])
+  @@index([email])
+  @@map("leads")
+}
+
+model CampaignLog {
+  id         String   @id @default(cuid())
+  campaignId String
+  leadId     String?
+  action     String   // created_campaign, imported_leads, started_processing, sent_email, failed_email, etc.
+  details    String? // JSON details
+  status     String   // success, error, warning, info
+  createdAt  DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("campaign_logs")
+}
+
+model TemporaryEmail {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  leadId    String?
+  campaignId String?
+  createdAt DateTime @default(now())
+  expiresAt DateTime // 10 minutes TTL
+
+  @@index([campaignId])
+  @@map("temporary_emails")
+}
+
+model WeTransferAccount {
+  id              String   @id @default(cuid())
+  tempEmail       String   @unique
+  weTransferId    String?
+  authToken       String?
+  campaignId      String?
+  status          String   @default("pending") // pending, created, failed
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime
+
+  @@index([campaignId])
+  @@map("wetransfer_accounts")
+}

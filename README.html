@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>3D Suite — Complete Installation & Operations Guide</title>
+  <meta name="description" content="Complete installation, configuration, feature, and troubleshooting guide for 3D Suite." />
+  <style>
+    :root{
+      --bg:#0b1020;
+      --bg-soft:#11182d;
+      --panel:#121a30;
+      --panel-2:#17213c;
+      --text:#eaf0ff;
+      --muted:#9fb0d0;
+      --line:#263252;
+      --brand:#7c5cff;
+      --brand-2:#4fd1c5;
+      --brand-3:#60a5fa;
+      --good:#34d399;
+      --warn:#f59e0b;
+      --bad:#fb7185;
+      --code:#0a0f1d;
+      --shadow:0 16px 40px rgba(0,0,0,.24);
+      --radius:20px;
+      --radius-sm:13px;
+      --sidebar:300px;
+      --max:1540px;
+    }
+    html[data-theme="light"]{
+      --bg:#f5f7fb;
+      --bg-soft:#eef2f8;
+      --panel:#ffffff;
+      --panel-2:#f7f9fc;
+      --text:#101828;
+      --muted:#667085;
+      --line:#d9e0eb;
+      --brand:#6c4cff;
+      --brand-2:#0ea5a4;
+      --brand-3:#2563eb;
+      --good:#059669;
+      --warn:#d97706;
+      --bad:#e11d48;
+      --code:#111827;
+      --shadow:0 14px 34px rgba(15,23,42,.10);
+    }
+    *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
+    body{
+      margin:0;
+      font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 14% 8%, rgba(124,92,255,.16), transparent 30%),
+        radial-gradient(circle at 86% 18%, rgba(79,209,197,.11), transparent 26%),
+        var(--bg);
+      color:var(--text);
+      line-height:1.6;
+    }
+    a{color:var(--brand-3);text-decoration:none}
+    a:hover{text-decoration:underline}
+    code,kbd,pre{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+    .shell{max-width:var(--max);margin:0 auto;display:grid;grid-template-columns:var(--sidebar) minmax(0,1fr);min-height:100vh}
+    .sidebar{
+      position:sticky;top:0;height:100vh;padding:24px 18px;border-right:1px solid var(--line);
+      background:color-mix(in srgb,var(--bg) 86%,transparent);
+      backdrop-filter:blur(18px);overflow:auto
+    }
+    .brand{
+      display:flex;align-items:center;gap:12px;padding:6px 8px 18px
+    }
+    .logo{
+      width:42px;height:42px;border-radius:14px;
+      background:linear-gradient(135deg,var(--brand),var(--brand-2));
+      display:grid;place-items:center;color:#fff;font-weight:900;box-shadow:var(--shadow)
+    }
+    .brand h1{font-size:17px;margin:0}
+    .brand p{font-size:12px;color:var(--muted);margin:2px 0 0}
+    .search{
+      width:100%;border:1px solid var(--line);background:var(--panel);color:var(--text);
+      border-radius:12px;padding:11px 12px;outline:none;margin:2px 0 14px
+    }
+    .search:focus{border-color:var(--brand)}
+    .nav-title{
+      margin:16px 8px 7px;font-size:11px;text-transform:uppercase;letter-spacing:.13em;color:var(--muted);font-weight:800
+    }
+    .nav a{
+      display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:10px;color:var(--muted);font-size:13px
+    }
+    .nav a:hover,.nav a.active{background:var(--panel);color:var(--text);text-decoration:none}
+    .side-actions{display:flex;gap:8px;margin-top:18px}
+    .btn{
+      appearance:none;border:1px solid var(--line);background:var(--panel);color:var(--text);
+      padding:9px 12px;border-radius:11px;cursor:pointer;font-weight:700
+    }
+    .btn:hover{transform:translateY(-1px)}
+    .btn.primary{background:linear-gradient(135deg,var(--brand),#5f79ff);border:0;color:#fff}
+    .content{padding:38px 44px 80px;min-width:0}
+    .hero{
+      padding:34px;border:1px solid var(--line);border-radius:28px;background:
+      linear-gradient(135deg,rgba(124,92,255,.15),rgba(79,209,197,.08)),
+      var(--panel);
+      box-shadow:var(--shadow);overflow:hidden;position:relative
+    }
+    .hero:after{
+      content:"";position:absolute;width:320px;height:320px;border-radius:50%;
+      background:radial-gradient(circle,rgba(124,92,255,.20),transparent 70%);
+      right:-100px;top:-100px;pointer-events:none
+    }
+    .eyebrow{
+      display:inline-flex;gap:8px;align-items:center;padding:6px 10px;border-radius:999px;
+      background:rgba(124,92,255,.13);color:#b8aaff;border:1px solid rgba(124,92,255,.26);
+      font-size:12px;font-weight:800;letter-spacing:.05em;text-transform:uppercase
+    }
+    .hero h2{font-size:42px;line-height:1.08;margin:14px 0 12px;max-width:900px}
+    .hero p{color:var(--muted);font-size:17px;max-width:900px}
+    .hero-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:24px}
+    .metric{
+      padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.025)
+    }
+    .metric strong{font-size:22px;display:block}
+    .metric span{color:var(--muted);font-size:12px}
+    section{scroll-margin-top:20px;padding-top:44px}
+    h2.section-title{font-size:29px;margin:0 0 8px}
+    .section-lead{margin:0 0 22px;color:var(--muted);max-width:920px}
+    .grid{display:grid;gap:16px}
+    .grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+    .card{
+      background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px;box-shadow:0 8px 28px rgba(0,0,0,.08)
+    }
+    .card h3{margin:0 0 8px;font-size:18px}
+    .card p{margin:0;color:var(--muted)}
+    .tag{
+      display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:800;
+      border:1px solid var(--line);background:var(--panel-2);color:var(--muted);margin:2px 4px 2px 0
+    }
+    .tag.good{color:var(--good)}
+    .tag.warn{color:var(--warn)}
+    .tag.bad{color:var(--bad)}
+    .callout{
+      padding:16px 18px;border-radius:16px;border:1px solid var(--line);background:var(--panel-2);margin:16px 0
+    }
+    .callout.good{border-color:color-mix(in srgb,var(--good) 38%,var(--line));}
+    .callout.warn{border-color:color-mix(in srgb,var(--warn) 38%,var(--line));}
+    .callout.bad{border-color:color-mix(in srgb,var(--bad) 38%,var(--line));}
+    .callout strong{display:block;margin-bottom:4px}
+    .code{
+      position:relative;background:var(--code);border:1px solid #263041;border-radius:15px;overflow:hidden;margin:14px 0
+    }
+    .code-head{
+      display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #263041;
+      color:#9fb0d0;font-size:11px;background:#0d1425
+    }
+    .copy{
+      border:1px solid #33405a;background:#172033;color:#d9e4ff;border-radius:8px;padding:5px 8px;cursor:pointer;font-size:11px
+    }
+    pre{margin:0;padding:16px;overflow:auto;color:#d7e2f7;font-size:13px;line-height:1.55}
+    .step{
+      display:grid;grid-template-columns:42px minmax(0,1fr);gap:14px;align-items:start;margin:14px 0
+    }
+    .step-num{
+      width:38px;height:38px;border-radius:12px;display:grid;place-items:center;font-weight:900;color:#fff;
+      background:linear-gradient(135deg,var(--brand),#4f7cff)
+    }
+    .step h4{margin:2px 0 4px}
+    .step p{margin:0;color:var(--muted)}
+    table{width:100%;border-collapse:collapse;margin:14px 0;background:var(--panel);border-radius:14px;overflow:hidden}
+    th,td{padding:12px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+    th{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);background:var(--panel-2)}
+    td{font-size:14px}
+    tr:last-child td{border-bottom:0}
+    .diagram{
+      display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:18px;border:1px dashed var(--line);border-radius:18px;background:var(--panel-2)
+    }
+    .node{padding:11px 14px;border:1px solid var(--line);border-radius:12px;background:var(--panel);font-weight:700}
+    .arrow{color:var(--muted);font-weight:900}
+    .kbd{padding:2px 6px;border-radius:6px;border:1px solid var(--line);background:var(--panel-2);font-size:12px}
+    .footer{margin-top:60px;padding:26px 0;color:var(--muted);font-size:13px;border-top:1px solid var(--line)}
+    .hidden-search{display:none!important}
+    .mobile-top{display:none}
+    .toc-note{font-size:12px;color:var(--muted);margin:10px 8px 0}
+    @media(max-width:1100px){
+      .shell{grid-template-columns:1fr}
+      .sidebar{display:none}
+      .mobile-top{display:flex;position:sticky;top:0;z-index:20;padding:10px 14px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(14px);justify-content:space-between}
+      .content{padding:24px 18px 60px}
+      .hero-grid,.grid.three{grid-template-columns:repeat(2,1fr)}
+    }
+    @media(max-width:720px){
+      .hero{padding:24px}.hero h2{font-size:34px}
+      .hero-grid,.grid.two,.grid.three{grid-template-columns:1fr}
+      .content{padding:20px 14px 50px}
+      th,td{padding:10px}
+    }
+  </style>
+</head>
+<body>
+  <div class="mobile-top">
+    <strong>3D Suite Docs</strong>
+    <button class="btn" id="themeMobile">Theme</button>
+  </div>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">3D</div>
+        <div>
+          <h1>3D Suite</h1>
+          <p>Complete operations handbook</p>
+        </div>
+      </div>
+
+      <input id="search" class="search" type="search" placeholder="Search documentation…" />
+
+      <div class="nav" id="nav">
+        <div class="nav-title">Getting started</div>
+        <a href="#overview">Overview</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#installation">Installation</a>
+        <a href="#run">How to run</a>
+        <a href="#folders">Project structure</a>
+
+        <div class="nav-title">Senders</div>
+        <a href="#wetransfer">WeTransfer</a>
+        <a href="#adobe">Adobe Acrobat</a>
+        <a href="#gmail">Gmail</a>
+
+        <div class="nav-title">Automation</div>
+        <a href="#placeholders">Placeholders & autograb</a>
+        <a href="#logos">Company logo autograb</a>
+        <a href="#qrcode">QR code autograb</a>
+        <a href="#attachments">HTML attachments</a>
+        <a href="#cloudflare">Cloudflare redirects</a>
+
+        <div class="nav-title">Operations</div>
+        <a href="#oauth">Google OAuth</a>
+        <a href="#chromium">Chromium profiles</a>
+        <a href="#logs">Dashboard logs</a>
+        <a href="#troubleshooting">Troubleshooting</a>
+        <a href="#security">Security notes</a>
+        <a href="#commands">Command reference</a>
+      </div>
+
+      <div class="side-actions">
+        <button class="btn" id="theme">Toggle theme</button>
+        <button class="btn primary" onclick="window.print()">Print</button>
+      </div>
+      <div class="toc-note">Tip: use the search box to instantly filter documentation sections.</div>
+    </aside>
+
+    <main class="content">
+      <div class="hero" id="overview" data-search>
+        <span class="eyebrow">3D Suite • Complete Guide</span>
+        <h2>Installation, configuration, sender workflows, autograb, document generation, and troubleshooting.</h2>
+        <p>
+          This README documents the current 3D Suite workflow as developed across the Web, API, browser automation,
+          Adobe, WeTransfer, Gmail, Cloudflare redirect, HTML rendering, Logo.dev, QR, and generated-attachment features.
+        </p>
+        <div class="hero-grid">
+          <div class="metric"><strong>3</strong><span>Primary sender modules</span></div>
+          <div class="metric"><strong>4+</strong><span>Generated attachment formats</span></div>
+          <div class="metric"><strong>10+</strong><span>Autograb placeholders</span></div>
+          <div class="metric"><strong>1</strong><span>Unified dashboard</span></div>
+        </div>
+      </div>
+
+      <section id="architecture" data-search>
+        <h2 class="section-title">System architecture</h2>
+        <p class="section-lead">
+          3D Suite is structured as a web dashboard plus an API/backend layer. Browser-assisted workflows use Chromium/Playwright,
+          while direct API workflows such as Gmail use OAuth tokens after initial authorization.
+        </p>
+        <div class="diagram">
+          <div class="node">apps/web</div><div class="arrow">→</div>
+          <div class="node">Dashboard UI</div><div class="arrow">→</div>
+          <div class="node">apps/api</div><div class="arrow">→</div>
+          <div class="node">Provider logic</div><div class="arrow">→</div>
+          <div class="node">Gmail / Adobe / WeTransfer / Cloudflare</div>
+        </div>
+        <div class="grid three" style="margin-top:16px">
+          <div class="card"><h3>Web app</h3><p>Sender selection, recipients, configuration, logs, previews, OAuth setup, attachments, autograb controls.</p></div>
+          <div class="card"><h3>API app</h3><p>OAuth callbacks, browser automation, message generation, file conversion, provider integration, token persistence.</p></div>
+          <div class="card"><h3>Browser layer</h3><p>Chromium profiles, Playwright, optional unpacked extension loading, Adobe browser automation, WeTransfer browser flows.</p></div>
+        </div>
+      </section>
+
+      <section id="installation" data-search>
+        <h2 class="section-title">Installation</h2>
+        <p class="section-lead">Run these commands from the 3D-SUITEG project root unless noted otherwise.</p>
+
+        <div class="step"><div class="step-num">1</div><div><h4>Install Node.js</h4><p>Use a current supported Node.js release. Confirm Node and npm are available.</p></div></div>
+        <div class="code"><div class="code-head"><span>PowerShell / CMD</span><button class="copy">Copy</button></div><pre>node --version
+npm --version</pre></div>
+
+        <div class="step"><div class="step-num">2</div><div><h4>Install project dependencies</h4><p>Install the monorepo dependencies from the root.</p></div></div>
+        <div class="code"><div class="code-head"><span>Install</span><button class="copy">Copy</button></div><pre>npm install</pre></div>
+
+        <div class="step"><div class="step-num">3</div><div><h4>Install attachment-generation dependencies</h4><p>These are used by QR, DOCX, PPTX, and Chromium-rendered documents.</p></div></div>
+        <div class="code"><div class="code-head"><span>Required for generated attachments</span><button class="copy">Copy</button></div><pre>npm install docx pptxgenjs qrcode
+npm install -D @types/qrcode</pre></div>
+
+        <div class="step"><div class="step-num">4</div><div><h4>Ensure Playwright browser support</h4><p>The project already uses browser automation. If Playwright browsers are not installed, install Chromium.</p></div></div>
+        <div class="code"><div class="code-head"><span>Playwright Chromium</span><button class="copy">Copy</button></div><pre>npx playwright install chromium</pre></div>
+
+        <div class="callout warn">
+          <strong>Windows Chromium paths</strong>
+          3D Suite can auto-detect common Chromium locations. If detection fails, use the optional Chromium path fields in the Gmail dashboard.
+        </div>
+      </section>
+
+      <section id="run" data-search>
+        <h2 class="section-title">How to run 3D Suite</h2>
+        <p class="section-lead">The normal development workflow starts both the web and API apps from the repository root.</p>
+        <div class="code"><div class="code-head"><span>Start development mode</span><button class="copy">Copy</button></div><pre>npm run dev</pre></div>
+        <div class="grid two">
+          <div class="card">
+            <h3>Web dashboard</h3>
+            <p>Normally available on the web application port used by your project, commonly <code>http://localhost:7200</code>.</p>
+          </div>
+          <div class="card">
+            <h3>API</h3>
+            <p>Current OAuth callback examples use <code>http://localhost:7201</code> for the API app.</p>
+          </div>
+        </div>
+        <div class="callout good">
+          <strong>After replacing route or dashboard files</strong>
+          Restart <code>npm run dev</code> if Next.js does not pick up a newly created route or if an old OAuth scope appears in generated URLs.
+        </div>
+      </section>
+
+      <section id="folders" data-search>
+        <h2 class="section-title">Important project paths</h2>
+        <table>
+          <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>apps/web/src/app/dashboard/page.tsx</code></td><td>Main 3D Suite dashboard and sender UI.</td></tr>
+            <tr><td><code>apps/api/src/app/api/gmail/...</code></td><td>Gmail OAuth, connection status, sending, Chromium profile discovery.</td></tr>
+            <tr><td><code>apps/api/src/lib/gmail-oauth-store.ts</code></td><td>Persists connected Gmail OAuth information.</td></tr>
+            <tr><td><code>apps/api/src/lib/wetransfer.ts</code></td><td>WeTransfer browser logic.</td></tr>
+            <tr><td><code>apps/api/src/lib/wetransfer-engine.ts</code></td><td>WeTransfer session and mailbox/provider orchestration.</td></tr>
+            <tr><td><code>apps/api/src/app/api/cloudflare-redirects/route.ts</code></td><td>Cloudflare redirect creation endpoint.</td></tr>
+            <tr><td><code>cloudflare-redirect-worker/</code></td><td>Cloudflare Worker redirect service.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="wetransfer" data-search>
+        <h2 class="section-title">WeTransfer sender</h2>
+        <p class="section-lead">
+          The WeTransfer module uses browser automation and temporary mailbox providers to create/use a WeTransfer session and send files.
+        </p>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>Current intended batch structure</h3>
+            <p>One WeTransfer signup/browser session handles individual recipients sequentially, with session/account rotation after the configured batch boundary.</p>
+          </div>
+          <div class="card">
+            <h3>Temporary mailbox providers</h3>
+            <p>The provider selection is passed from the dashboard to the backend. Existing integration work covered MailSlurp and Temp-Mail.io, with provider-aware mailbox creation and OTP polling.</p>
+          </div>
+        </div>
+
+        <h3>Sequential send flow</h3>
+        <div class="diagram">
+          <div class="node">Create temp mailbox</div><div class="arrow">→</div>
+          <div class="node">Open Dolphin/Chromium profile</div><div class="arrow">→</div>
+          <div class="node">Create WeTransfer account</div><div class="arrow">→</div>
+          <div class="node">Upload recipient file</div><div class="arrow">→</div>
+          <div class="node">Send</div><div class="arrow">→</div>
+          <div class="node">Next recipient</div>
+        </div>
+
+        <div class="callout warn">
+          <strong>Provider mismatch troubleshooting</strong>
+          If logs say MailSlurp while Temp-Mail.io is selected, verify the dashboard passes the selected provider property and the engine uses the unified provider layer.
+        </div>
+
+        <h3>Useful WeTransfer log format</h3>
+        <div class="code"><div class="code-head"><span>Example</span><button class="copy">Copy</button></div><pre>WETRANSFER SEQUENTIAL RECIPIENT | 1/10 | user@example.com
+WETRANSFER SEQUENTIAL COMPLETE | 1/10 | user@example.com | generated-file.pdf</pre></div>
+      </section>
+
+      <section id="adobe" data-search>
+        <h2 class="section-title">Adobe Acrobat sender</h2>
+        <p class="section-lead">
+          Adobe is implemented as browser automation against the normal Acrobat web UI rather than relying on an Acrobat Sign API license.
+        </p>
+        <div class="grid two">
+          <div class="card"><h3>Login</h3><p>Adobe login happens in a normal browser session. The user signs in manually and the existing session is reused.</p></div>
+          <div class="card"><h3>Sharing</h3><p>Upload a PDF, wait for the document view, click Share, enter recipient(s), commit suggestions, invite, then return to the Acrobat files page for the next upload.</p></div>
+        </div>
+
+        <h3>Important UI behavior already handled</h3>
+        <ul>
+          <li>Wait for Acrobat upload/document completion rather than relying only on a timeout.</li>
+          <li>Open the Share dialog after upload.</li>
+          <li>Handle the placeholder invite field that changes into the real invite input.</li>
+          <li>Use multiple selectors for Adobe invite fields.</li>
+          <li>Commit autocomplete suggestions for recipient addresses.</li>
+          <li>Return to <code>https://acrobat.adobe.com/documents/files/</code> after each invite/send cycle.</li>
+        </ul>
+
+        <div class="callout warn">
+          <strong>Adobe account send limits</strong>
+          Adobe account/plan limits are enforced by Adobe. Browser automation cannot increase the plan's allowed sends.
+        </div>
+      </section>
+
+      <section id="gmail" data-search>
+        <h2 class="section-title">Gmail sender</h2>
+        <p class="section-lead">
+          Gmail is a separate sender module. Initial connection uses Google OAuth; sending uses the Gmail API with the connected account's saved authorization.
+        </p>
+
+        <div class="grid three">
+          <div class="card"><h3>Existing Chromium profile</h3><p>Scan manually, select a profile, then open Google OAuth in that profile.</p></div>
+          <div class="card"><h3>Chromium profile + extension</h3><p>Launch the selected profile and load an unpacked extension using Chromium's supported <code>--load-extension</code> behavior.</p></div>
+          <div class="card"><h3>Manual OAuth URL</h3><p>Generate an OAuth URL, open it in any browser/profile or even another PC, then paste the resulting callback URL back into 3D Suite.</p></div>
+        </div>
+
+        <h3>Dashboard OAuth fields</h3>
+        <table>
+          <thead><tr><th>Field</th><th>Required?</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Google Client ID</td><td><span class="tag good">Required</span></td><td>Identifies the 3D Suite OAuth app.</td></tr>
+            <tr><td>Google Client Secret</td><td><span class="tag good">Required</span></td><td>Used during OAuth token exchange.</td></tr>
+            <tr><td>OAuth Redirect URI</td><td><span class="tag good">Required</span></td><td>Auto-filled as <code>http://localhost:7201/api/gmail/oauth/callback</code> in the current setup.</td></tr>
+            <tr><td>Chromium User Data directory</td><td><span class="tag">Optional</span></td><td>Use if profile auto-detection needs help.</td></tr>
+            <tr><td>Chromium executable path</td><td><span class="tag">Optional</span></td><td>Use if Chromium executable auto-detection fails.</td></tr>
+            <tr><td>Extension folder</td><td><span class="tag">Optional</span></td><td>Required only in Chromium profile + extension mode.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Current Gmail send features</h3>
+        <div class="grid three">
+          <div class="card"><h3>From name</h3><p>Set a custom display name while Gmail remains the authenticated sender.</p></div>
+          <div class="card"><h3>Reply-To</h3><p>Optional Reply-To header so responses can go to a different address.</p></div>
+          <div class="card"><h3>Account rotation</h3><p>Enable multiple connected Gmail accounts and distribute recipients round-robin.</p></div>
+          <div class="card"><h3>Per-account caps</h3><p>Set editable maximum sends per account for the current run, such as 350 / 500 / 300.</p></div>
+          <div class="card"><h3>HTML + live preview</h3><p>Switch between Plain Text and HTML. HTML preview updates in real time.</p></div>
+          <div class="card"><h3>Attachments</h3><p>Upload files or generate PDF, PPTX, DOCX, or SVG from HTML.</p></div>
+        </div>
+
+        <h3>Rotation example</h3>
+        <div class="code"><div class="code-head"><span>Per-account send plan</span><button class="copy">Copy</button></div><pre>account-a@gmail.com    max 350
+account-b@gmail.com    max 500
+account-c@gmail.com    max 300
+
+Recipient 1 → account A
+Recipient 2 → account B
+Recipient 3 → account C
+Recipient 4 → account A
+...
+When an account reaches its cap, it is skipped.</pre></div>
+
+        <div class="callout good">
+          <strong>Gmail Sent folder behavior</strong>
+          Messages sent through Gmail's native send API are stored in Gmail Sent. The SENT system label cannot be manually removed through the normal label-modify workflow.
+        </div>
+      </section>
+
+      <section id="oauth" data-search>
+        <h2 class="section-title">Google OAuth setup</h2>
+        <p class="section-lead">Create one OAuth app for 3D Suite, then connect multiple Gmail accounts to it.</p>
+
+        <div class="step"><div class="step-num">1</div><div><h4>Create a Google Cloud project</h4><p>Create/select a project for 3D Suite.</p></div></div>
+        <div class="step"><div class="step-num">2</div><div><h4>Enable Gmail API</h4><p>Enable Gmail API for the selected project.</p></div></div>
+        <div class="step"><div class="step-num">3</div><div><h4>Configure OAuth consent</h4><p>For a personal Gmail owner, use an External audience. Add test users while the app is in Testing.</p></div></div>
+        <div class="step"><div class="step-num">4</div><div><h4>Create Web application credentials</h4><p>Create a Web application OAuth client and copy the Client ID and Client Secret into the 3D Suite dashboard.</p></div></div>
+        <div class="step"><div class="step-num">5</div><div><h4>Add redirect URI</h4><p>Add exactly:</p></div></div>
+        <div class="code"><div class="code-head"><span>Authorized redirect URI</span><button class="copy">Copy</button></div><pre>http://localhost:7201/api/gmail/oauth/callback</pre></div>
+
+        <h3>Manual OAuth from another PC</h3>
+        <div class="diagram">
+          <div class="node">Generate OAuth URL</div><div class="arrow">→</div>
+          <div class="node">Open on another PC</div><div class="arrow">→</div>
+          <div class="node">Approve Google</div><div class="arrow">→</div>
+          <div class="node">localhost callback fails there</div><div class="arrow">→</div>
+          <div class="node">Copy full callback URL</div><div class="arrow">→</div>
+          <div class="node">Paste into 3D Suite</div>
+        </div>
+        <div class="callout warn">
+          <strong>Why localhost fails on another PC</strong>
+          <code>localhost</code> always means the machine currently running the browser. The cross-PC paste-back flow exists specifically for this case.
+        </div>
+      </section>
+
+      <section id="chromium" data-search>
+        <h2 class="section-title">Chromium profile handling</h2>
+        <p class="section-lead">
+          Profile scanning is manual. Friendly profile names are read from Chromium's profile metadata and mapped to actual folders such as Default, Profile 1, Profile 2, etc.
+        </p>
+        <div class="code"><div class="code-head"><span>Typical Windows Chromium user data path</span><button class="copy">Copy</button></div><pre>C:\Users\&lt;username&gt;\AppData\Local\Chromium\User Data</pre></div>
+        <div class="grid two">
+          <div class="card"><h3>Friendly display names</h3><p>A profile may appear as an email, person's name, or business name even though the disk folder is still <code>Profile 3</code>.</p></div>
+          <div class="card"><h3>Already-open profiles</h3><p>Chromium may reuse an already-running profile/process. Extension loading is most reliable when the extension is already installed or when 3D Suite launches the profile itself.</p></div>
+        </div>
+      </section>
+
+      <section id="placeholders" data-search>
+        <h2 class="section-title">Placeholders & autograb</h2>
+        <p class="section-lead">Placeholders are resolved independently for each recipient before the final email or generated attachment is created.</p>
+        <table>
+          <thead><tr><th>Placeholder</th><th>Meaning</th><th>Example</th></tr></thead>
+          <tbody>
+            <tr><td><code>{Email}</code></td><td>Full recipient email</td><td>alex@armasterservices.org</td></tr>
+            <tr><td><code>{LocalPart}</code></td><td>Part before @</td><td>alex</td></tr>
+            <tr><td><code>{Domain}</code></td><td>Email domain</td><td>armasterservices.org</td></tr>
+            <tr><td><code>{DomainName}</code></td><td>First domain label</td><td>armasterservices</td></tr>
+            <tr><td><code>{Date}</code></td><td>Current generated date</td><td>2026-07-21</td></tr>
+            <tr><td><code>{Random6}</code></td><td>Random six-digit value</td><td>492817</td></tr>
+            <tr><td><code>{Random8}</code></td><td>Random eight-digit value</td><td>57284019</td></tr>
+            <tr><td><code>{OriginalName}</code></td><td>Original attachment basename</td><td>invoice</td></tr>
+            <tr><td><code>{Ext}</code></td><td>Attachment extension</td><td>pdf</td></tr>
+            <tr><td><code>{CompanyLogo}</code></td><td>Logo.dev image URL generated from recipient domain</td><td>Logo for armasterservices.org</td></tr>
+            <tr><td><code>{QRCode}</code></td><td>Generated QR image data URI</td><td>PNG data URI</td></tr>
+            <tr><td><code>{AttachmentLink}</code></td><td>Dashboard Attachment Link field</td><td>https://example.com/document</td></tr>
+            <tr><td><code>{CTA}</code></td><td>Dashboard CTA Link field</td><td>https://example.com/action</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Example HTML</h3>
+        <div class="code"><div class="code-head"><span>HTML email / generated attachment</span><button class="copy">Copy</button></div><pre>&lt;div style="font-family:Arial,sans-serif"&gt;
+  &lt;img src="{CompanyLogo}" style="max-width:160px;height:auto;"&gt;
+
+  &lt;h2&gt;Document for {DomainName}&lt;/h2&gt;
+
+  &lt;p&gt;Reference: &lt;strong&gt;{Random8}&lt;/strong&gt;&lt;/p&gt;
+  &lt;p&gt;Date: {Date}&lt;/p&gt;
+
+  &lt;a href="{AttachmentLink}"&gt;View Attachment&lt;/a&gt;
+
+  &lt;img
+    src="{QRCode}"
+    style="width:140px;height:140px;"
+    alt="QR code"
+  &gt;
+&lt;/div&gt;</pre></div>
+      </section>
+
+      <section id="logos" data-search>
+        <h2 class="section-title">Company logo autograb with Logo.dev</h2>
+        <p class="section-lead">
+          When enabled, <code>{CompanyLogo}</code> is converted into a Logo.dev CDN URL based on each recipient's email domain.
+        </p>
+        <div class="diagram">
+          <div class="node">alex@armasterservices.org</div><div class="arrow">→</div>
+          <div class="node">armasterservices.org</div><div class="arrow">→</div>
+          <div class="node">Logo.dev CDN</div><div class="arrow">→</div>
+          <div class="node">{CompanyLogo}</div>
+        </div>
+
+        <h3>Dashboard settings</h3>
+        <ul>
+          <li>Enable Logo.dev company logo autograb</li>
+          <li>Publishable Key</li>
+          <li>Logo size</li>
+          <li>Format: PNG or WebP</li>
+          <li>Theme: Auto / Light / Dark</li>
+        </ul>
+
+        <div class="code"><div class="code-head"><span>Generated CDN pattern</span><button class="copy">Copy</button></div><pre>https://img.logo.dev/{Domain}?token=pk_...&amp;size=128&amp;format=png&amp;theme=auto</pre></div>
+      </section>
+
+      <section id="qrcode" data-search>
+        <h2 class="section-title">QR code autograb</h2>
+        <p class="section-lead">
+          QR generation is optional and uses the <code>{QRCode}</code> placeholder. QR image size is controlled by the HTML itself.
+        </p>
+        <h3>QR data source options</h3>
+        <div class="grid three">
+          <div class="card"><h3>Attachment Link</h3><p>Encode the dashboard's Attachment Link value.</p></div>
+          <div class="card"><h3>CTA Link</h3><p>Encode the dashboard's CTA Link value.</p></div>
+          <div class="card"><h3>Custom data / URL</h3><p>Encode any custom URL or text value entered in the QR field.</p></div>
+        </div>
+
+        <div class="code"><div class="code-head"><span>QR placement example</span><button class="copy">Copy</button></div><pre>&lt;img src="{QRCode}" style="width:160px;height:160px;"&gt;</pre></div>
+
+        <div class="callout good">
+          <strong>Generated before conversion</strong>
+          QR data URI replacement occurs before PDF, PPTX, DOCX, or SVG rendering, so the QR becomes part of the rendered document.
+        </div>
+      </section>
+
+      <section id="attachments" data-search>
+        <h2 class="section-title">Gmail attachment modes</h2>
+        <p class="section-lead">Attachment support is controlled by a master toggle. Only one attachment mode can be selected at a time.</p>
+
+        <div class="grid three">
+          <div class="card"><h3>Upload</h3><p>Attach an existing file directly.</p></div>
+          <div class="card"><h3>HTML → PDF</h3><p>Render completed HTML through Chromium and create a single A4-style portrait PDF.</p></div>
+          <div class="card"><h3>HTML → PPTX</h3><p>Render HTML visually and place it into one A4-style portrait PowerPoint slide.</p></div>
+          <div class="card"><h3>HTML → DOCX</h3><p>Render HTML visually and fit it into one A4-style Word page.</p></div>
+          <div class="card"><h3>HTML → SVG</h3><p>Create one A4-style SVG canvas containing the completed HTML.</p></div>
+        </div>
+
+        <h3>Single-page behavior</h3>
+        <div class="code"><div class="code-head"><span>Current target</span><button class="copy">Copy</button></div><pre>PDF   → 1 A4 portrait page
+PPTX  → 1 A4-style portrait slide
+DOCX  → 1 A4-style Word page
+SVG   → 1 A4-style canvas</pre></div>
+
+        <div class="callout warn">
+          <strong>Visual fidelity vs native editability</strong>
+          PPTX and DOCX preserve appearance by using a rendered image of the completed HTML. This keeps logos, colors, spacing, QR codes, and CSS looking like the browser render, but the underlying text is not recreated as fully native editable Word/PowerPoint elements.
+        </div>
+
+        <h3>Hyperlinks</h3>
+        <table>
+          <thead><tr><th>Format</th><th>Clickable links</th><th>Behavior</th></tr></thead>
+          <tbody>
+            <tr><td>HTML email</td><td>Yes</td><td>Normal HTML anchors.</td></tr>
+            <tr><td>PDF</td><td>Generally yes</td><td>Chromium PDF rendering preserves anchors.</td></tr>
+            <tr><td>PPTX</td><td>Yes</td><td>Transparent hyperlink overlays are positioned from the original HTML anchor bounds.</td></tr>
+            <tr><td>DOCX</td><td>Limited</td><td>Visual HTML is rendered as an image; detected links are preserved separately because positional transparent overlays are not robust through the current DOCX library.</td></tr>
+            <tr><td>SVG</td><td>Viewer-dependent</td><td>HTML anchors remain inside the foreignObject structure.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="cloudflare" data-search>
+        <h2 class="section-title">Cloudflare redirect generator</h2>
+        <p class="section-lead">
+          3D Suite includes a Cloudflare redirect workflow built around a Worker and backend route. It is designed to generate worker.dev-based redirect links from the dashboard.
+        </p>
+        <div class="grid two">
+          <div class="card"><h3>Cloudflare Account ID</h3><p>Obtained from the Cloudflare dashboard/account overview.</p></div>
+          <div class="card"><h3>Cloudflare API Token</h3><p>Use a token with the permissions required by the deployed Worker/KV configuration.</p></div>
+        </div>
+        <h3>Relevant project files</h3>
+        <div class="code"><div class="code-head"><span>Cloudflare files</span><button class="copy">Copy</button></div><pre>apps/api/src/app/api/cloudflare-redirects/route.ts
+apps/api/src/lib/cloudflare-redirects.ts
+cloudflare-redirect-worker/src/index.js
+cloudflare-redirect-worker/wrangler.jsonc</pre></div>
+        <div class="callout good">
+          <strong>Worker hostname</strong>
+          A deployed Worker gets a <code>workers.dev</code> hostname unless you attach a custom route/domain in Cloudflare.
+        </div>
+      </section>
+
+      <section id="logs" data-search>
+        <h2 class="section-title">Dashboard logs</h2>
+        <p class="section-lead">Sender logs are intended to be simple, sequential, and easy to audit.</p>
+        <h3>Gmail example</h3>
+        <div class="code"><div class="code-head"><span>Result logs</span><button class="copy">Copy</button></div><pre>1/50 ✅ SENT — user@example.com — via account-a@gmail.com — messageId=...
+2/50 ✅ SENT — another@example.com — via account-b@gmail.com — messageId=...
+3/50 ❌ FAILED — third@example.com — via account-c@gmail.com — error...</pre></div>
+        <h3>Important Gmail status behavior</h3>
+        <p>
+          Gmail account status polling was changed to avoid terminal/dashboard flooding. Status is checked on panel load, after connect/disconnect,
+          and when the user clicks <strong>Refresh accounts</strong>.
+        </p>
+      </section>
+
+      <section id="troubleshooting" data-search>
+        <h2 class="section-title">Troubleshooting</h2>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>Gmail status returns 404</h3>
+          <p>Verify <code>apps/api/src/app/api/gmail/oauth/status/route.ts</code> exists, then restart the development server.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>OAuth URL still shows an old scope</h3>
+          <p>Confirm the current connect route is installed and restart <code>npm run dev</code>. Generate a brand-new OAuth URL after restarting.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>Request had insufficient authentication scopes</h3>
+          <p>The connected token was authorized with fewer scopes than the route is attempting to use. Disconnect and reconnect after correcting the requested scope.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>Manual OAuth callback fails on another PC</h3>
+          <p>Expected when the redirect is localhost. Copy the full failed callback URL and paste it into the 3D Suite manual callback completion field.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>Gmail account connects but does not appear in Send from</h3>
+          <p>Check the Gmail status route, then click <strong>Refresh accounts</strong>. The account is stored by the API and read back through the status endpoint.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>WeTransfer says MailSlurp while another provider is selected</h3>
+          <p>Verify the selected provider is passed from <code>credentials.wetransfer.provider</code> and that the backend engine uses the unified provider implementation.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h3>Adobe invite field times out</h3>
+          <p>Adobe changes the invite input after the initial placeholder field is clicked. Use multiple selectors and wait for the real invite field before typing.</p>
+        </div>
+
+        <div class="card">
+          <h3>PPTX/DOCX looks too small</h3>
+          <p>Current generated documents are configured as one A4-style portrait page/slide and proportionally fit the completed HTML. Keep the source HTML compact enough to remain readable when fitted to one page.</p>
+        </div>
+      </section>
+
+      <section id="security" data-search>
+        <h2 class="section-title">Security & operational notes</h2>
+        <div class="grid two">
+          <div class="card">
+            <h3>OAuth secrets</h3>
+            <p>Google Client Secret and refresh tokens are sensitive. Do not post them publicly or commit them into Git.</p>
+          </div>
+          <div class="card">
+            <h3>Publishable keys</h3>
+            <p>Logo.dev publishable keys are intended for client-visible usage, but still manage them deliberately and follow your provider plan terms.</p>
+          </div>
+          <div class="card">
+            <h3>Browser sessions</h3>
+            <p>Existing Chromium/Adobe/Google sessions may contain sensitive cookies. 3D Suite should reuse browser sessions rather than exporting session cookies.</p>
+          </div>
+          <div class="card">
+            <h3>Provider limits</h3>
+            <p>Gmail, Adobe, WeTransfer, Logo.dev, temporary mailbox providers, and Cloudflare all enforce their own account/API limits. Dashboard caps do not override provider limits.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="commands" data-search>
+        <h2 class="section-title">Command reference</h2>
+        <div class="code"><div class="code-head"><span>Install project</span><button class="copy">Copy</button></div><pre>npm install</pre></div>
+        <div class="code"><div class="code-head"><span>Install generated-document dependencies</span><button class="copy">Copy</button></div><pre>npm install docx pptxgenjs qrcode
+npm install -D @types/qrcode</pre></div>
+        <div class="code"><div class="code-head"><span>Install Playwright Chromium</span><button class="copy">Copy</button></div><pre>npx playwright install chromium</pre></div>
+        <div class="code"><div class="code-head"><span>Run development stack</span><button class="copy">Copy</button></div><pre>npm run dev</pre></div>
+        <div class="code"><div class="code-head"><span>Git status</span><button class="copy">Copy</button></div><pre>git status</pre></div>
+        <div class="code"><div class="code-head"><span>Commit and push</span><button class="copy">Copy</button></div><pre>git add .
+git commit -m "Update 3D Suite"
+git push</pre></div>
+      </section>
+
+      <div class="footer">
+        <strong>3D Suite README</strong><br />
+        Generated as a self-contained HTML operations guide. Keep this file in the repository root as <code>README.html</code> or alongside your deployment documentation.
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const root = document.documentElement;
+    const saved = localStorage.getItem('3d-suite-doc-theme');
+    if(saved) root.dataset.theme = saved;
+
+    function toggleTheme(){
+      const next = root.dataset.theme === 'light' ? 'dark' : 'light';
+      root.dataset.theme = next;
+      localStorage.setItem('3d-suite-doc-theme', next);
+    }
+    document.getElementById('theme')?.addEventListener('click',toggleTheme);
+    document.getElementById('themeMobile')?.addEventListener('click',toggleTheme);
+
+    document.querySelectorAll('.copy').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        const pre = btn.closest('.code')?.querySelector('pre');
+        if(!pre) return;
+        try{
+          await navigator.clipboard.writeText(pre.innerText);
+          const old = btn.textContent;
+          btn.textContent = 'Copied';
+          setTimeout(()=>btn.textContent=old,1000);
+        }catch{
+          btn.textContent='Select manually';
+        }
+      });
+    });
+
+    const search = document.getElementById('search');
+    search?.addEventListener('input', ()=>{
+      const q = search.value.trim().toLowerCase();
+      document.querySelectorAll('[data-search], main section').forEach(el=>{
+        const txt = el.innerText.toLowerCase();
+        el.classList.toggle('hidden-search', q && !txt.includes(q));
+      });
+    });
+
+    const links = [...document.querySelectorAll('.nav a')];
+    const sections = links.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);
+    const observer = new IntersectionObserver(entries=>{
+      const visible = entries.filter(e=>e.isIntersecting).sort((a,b)=>b.intersectionRatio-a.intersectionRatio)[0];
+      if(!visible) return;
+      links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+visible.target.id));
+    },{rootMargin:'-20% 0px -68% 0px',threshold:[0,.1,.25,.5]});
+    sections.forEach(s=>observer.observe(s));
+  </script>
+</body>
+</html>
