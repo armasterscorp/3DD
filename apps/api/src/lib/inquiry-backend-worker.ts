@@ -2,7 +2,9 @@ import { NextRequest } from 'next/server';
 import { POST as prepareInquiry } from '@/app/api/inquiry/prepare/route';
 import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
 import { addInquiryLog, addInquiryResult, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError, setInquiryRunState } from '@/lib/inquiry-run-store';
-import { closeInquirySession } from '@/lib/inquiry-browser-store';
+import { closeInquirySession, getInquirySession } from '@/lib/inquiry-browser-store';
+import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
+import { CaptchaStore } from '@/lib/captcha-store';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -103,6 +105,14 @@ export function startInquiryBackendWorker(args: {
   if (workers.has(key)) return;
 
   const task = (async () => {
+    // Load captcha config and initialise handler for this run
+    const captchaConfig = await CaptchaStore.getCaptchaConfig(args.licenseId).catch(() => null);
+    const captchaHandler = new InquiryCaptchaHandler(
+      args.licenseId,
+      args.runId,
+      captchaConfig?.apiKey,
+    );
+
     try {
       for (let i = Math.max(0, args.startIndex); i < args.targets.length; i += 1) {
         await inquiryCheckpoint(args.licenseId);
@@ -170,7 +180,18 @@ export function startInquiryBackendWorker(args: {
         if (prepareResponse.ok && prepared?.success) {
           const classification = String(prepared.classification || (prepared.captchaDetected ? 'captcha' : 'form_found'));
           if (classification === 'captcha') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; saved and skipped automatically` });
+            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; attempting automatic solve` });
+            const prepSession = await getInquirySession(args.sessionId, args.licenseId).catch(() => null);
+            if (prepSession) {
+              const captchaResult = await captchaHandler.handleCaptcha(prepSession.page);
+              if (captchaResult.handled && captchaResult.status === 'solved') {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — CAPTCHA solved on ${prepared.contactUrl || target}` });
+              } else {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA solving ${captchaResult.status} on ${prepared.contactUrl || target}${captchaResult.error ? `: ${captchaResult.error}` : ''}; queued for review and skipped automatically` });
+              }
+            } else {
+              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA on ${prepared.contactUrl || target} queued for review; skipped automatically` });
+            }
           } else if (classification === 'review_required') {
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${prepared.contactUrl || target} — ${prepared.reviewReason || 'manual interaction needed'}; saved and skipped automatically` });
           } else if (classification === 'site_unavailable') {
@@ -179,6 +200,21 @@ export function startInquiryBackendWorker(args: {
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — ${target} — no usable contact/quote/inquiry form found; skipped automatically` });
           } else if (classification === 'form_found') {
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}` });
+            // Check for CAPTCHA blocking the form before submitting
+            const preSubmitSession = await getInquirySession(args.sessionId, args.licenseId).catch(() => null);
+            if (preSubmitSession) {
+              const preDetection = await captchaHandler.detectCaptcha(preSubmitSession.page);
+              if (preDetection.detected) {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected before submit on ${prepared.contactUrl || target}; attempting automatic solve` });
+                const captchaResult = await captchaHandler.handleCaptcha(preSubmitSession.page);
+                if (captchaResult.handled && captchaResult.status === 'solved') {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — CAPTCHA solved before submit on ${prepared.contactUrl || target}` });
+                } else {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA solving ${captchaResult.status} on ${prepared.contactUrl || target}${captchaResult.error ? `: ${captchaResult.error}` : ''}; queued for review, skipping target` });
+                  continue;
+                }
+              }
+            }
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}` });
             await inquiryCheckpoint(args.licenseId);
             let submitResponse: Response;
@@ -226,7 +262,23 @@ export function startInquiryBackendWorker(args: {
             if (submitResponse.ok && submitted?.success) {
               addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — submission confirmed on ${submitted.currentUrl || prepared.contactUrl || target}${submitted.confirmation ? ` — ${submitted.confirmation}` : ''}` });
             } else if (submitted?.captchaDetected) {
-              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; saved and skipped automatically` });
+              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected during review/submit on ${target}; attempting automatic solve` });
+              const postSession = await getInquirySession(args.sessionId, args.licenseId).catch(() => null);
+              if (postSession) {
+                const postCaptcha = await captchaHandler.checkPostSubmitCaptcha(postSession.page);
+                if (postCaptcha.detected) {
+                  const postResult = await captchaHandler.handleCaptcha(postSession.page);
+                  if (postResult.handled && postResult.status === 'solved') {
+                    addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — post-submit CAPTCHA solved on ${target}` });
+                  } else {
+                    addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — post-submit CAPTCHA (${submitted.captchaProvider || 'CAPTCHA'}) solving ${postResult.status}${postResult.error ? `: ${postResult.error}` : ''}; queued for review and skipped automatically` });
+                  }
+                } else {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; queued for review and skipped automatically` });
+                }
+              } else {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; queued for review and skipped automatically` });
+              }
             } else if (submitted?.reviewRequired) {
               addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — ${submitted.reason || submitted.error || 'manual interaction needed'}; saved and skipped automatically` });
             } else {
