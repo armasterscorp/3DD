@@ -25,16 +25,21 @@ export class TwoCaptchaSolver {
 
   /**
    * Test connection to 2Captcha API
+   * A valid API key will either:
+   * - Accept a captcha submission (status 1) 
+   * - Return an image error (status 0 with ERROR_ZERO_CAPTCHA_FILESIZE) - this proves API key works
+   * An invalid API key will:
+   * - Return ERROR_INVALID_CAPTCHA_ID or similar authentication error
    */
   async testConnection(): Promise<{ success: boolean; error?: string }> {
     try {
       console.log('[2Captcha] Testing connection with API key:', this.apiKey.substring(0, 10) + '...');
       
-      // Test by submitting a dummy text captcha (cheapest operation)
+      // Test with a simple text captcha (cheapest and simplest)
       const params = new URLSearchParams();
       params.append('key', this.apiKey);
       params.append('method', 'post');
-      params.append('captchafile', 'base64:');
+      params.append('captchafile', 'base64:'); // Empty image
       params.append('json', '1');
 
       const response = await fetch(this.inUrl, {
@@ -49,30 +54,65 @@ export class TwoCaptchaSolver {
       console.log('[2Captcha] Test response status:', response.status);
       console.log('[2Captcha] Test response text:', responseText);
 
-      // Try to parse as JSON
       try {
         const data = JSON.parse(responseText);
         console.log('[2Captcha] Test response JSON:', data);
 
-        // status 0 = error
-        if (data.status === 0) {
-          return { success: false, error: data.error || 'API error' };
-        }
-
-        // status 1 = success (even if we get an error like "ERROR_ZERO_CAPTCHA_FILESIZE")
-        // That just means the image was invalid, but API key works
-        return { success: true };
-      } catch (e) {
-        // Try plain text response format
-        if (responseText.startsWith('ERROR')) {
-          const error = responseText.substring(6).trim();
-          return { success: false, error };
-        }
-        if (responseText.startsWith('OK')) {
+        // Status 1 = success (captcha was accepted)
+        if (data.status === 1) {
+          console.log('[2Captcha] ✓ API key is valid - captcha accepted');
           return { success: true };
         }
-        // Unknown response format
-        return { success: false, error: `Unknown response format: ${responseText.substring(0, 50)}` };
+
+        // Status 0 with these errors = API key works, just image is invalid
+        if (data.status === 0) {
+          const errorRequest = data.request || data.error_text || '';
+          
+          // These errors mean the API key is valid but image is bad
+          const validKeyErrors = [
+            'ERROR_ZERO_CAPTCHA_FILESIZE',
+            'ERROR_CAPTCHA_EMPTY',
+            'ERROR_WRONG_FILE_EXTENSION',
+            'ERROR_FILE_SIZE_IS_TOO_BIG',
+          ];
+
+          if (validKeyErrors.some(err => errorRequest.includes(err))) {
+            console.log('[2Captcha] ✓ API key is valid (image validation error is expected)');
+            return { success: true };
+          }
+
+          // These errors mean API key is INVALID
+          const invalidKeyErrors = [
+            'ERROR_INVALID_CAPTCHA_ID',
+            'ERROR_INVALID_CAPTCHA_ID',
+            'ERROR_BAD_CAPTCHA',
+            'ERROR_INVALID',
+          ];
+
+          if (invalidKeyErrors.some(err => errorRequest.includes(err))) {
+            console.log('[2Captcha] ✗ API key is invalid:', errorRequest);
+            return { success: false, error: `Invalid API key: ${errorRequest}` };
+          }
+
+          // Any other error
+          console.log('[2Captcha] ✓ API key appears valid (got:', errorRequest + ')');
+          return { success: true };
+        }
+
+        // Unexpected status
+        return { success: false, error: `Unexpected status: ${data.status}` };
+      } catch (parseError) {
+        // Handle plain text response
+        if (responseText.startsWith('OK')) {
+          console.log('[2Captcha] ✓ API key is valid');
+          return { success: true };
+        }
+        if (responseText.startsWith('ERROR')) {
+          const error = responseText.substring(6).trim();
+          console.log('[2Captcha] ✗ API error:', error);
+          return { success: false, error };
+        }
+        return { success: false, error: `Unknown response: ${responseText}` };
       }
     } catch (error: any) {
       console.error('[2Captcha] Connection test error:', error);
