@@ -2,7 +2,8 @@ import { NextRequest } from 'next/server';
 import { POST as prepareInquiry } from '@/app/api/inquiry/prepare/route';
 import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
 import { addInquiryLog, addInquiryResult, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError, setInquiryRunState } from '@/lib/inquiry-run-store';
-import { closeInquirySession } from '@/lib/inquiry-browser-store';
+import { closeInquirySession, getInquirySession } from '@/lib/inquiry-browser-store';
+import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -170,7 +171,80 @@ export function startInquiryBackendWorker(args: {
         if (prepareResponse.ok && prepared?.success) {
           const classification = String(prepared.classification || (prepared.captchaDetected ? 'captcha' : 'form_found'));
           if (classification === 'captcha') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; saved and skipped automatically` });
+            // Attempt to solve the CAPTCHA automatically before giving up
+            let captchaSolvedForSubmit = false;
+            try {
+              const session = await getInquirySession(args.sessionId, args.licenseId);
+              if (session) {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — attempting to solve CAPTCHA (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}` });
+                const captchaHandler = new InquiryCaptchaHandler(args.licenseId, args.runId);
+                const captchaResult = await captchaHandler.handleCaptcha(session.page);
+                if (captchaResult.handled && captchaResult.status === 'solved') {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — CAPTCHA solved; proceeding to submit ${target}` });
+                  captchaSolvedForSubmit = true;
+                } else if (captchaResult.status === 'unconfigured') {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; no solver configured — skipped automatically` });
+                } else {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; solve attempt failed (${captchaResult.error || captchaResult.status}) — skipped automatically` });
+                }
+              } else {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; saved and skipped automatically` });
+              }
+            } catch (captchaError) {
+              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; solve error (${captchaError instanceof Error ? captchaError.message : String(captchaError)}) — skipped automatically` });
+            }
+            if (!captchaSolvedForSubmit) {
+              // CAPTCHA not solved — skip this target
+            } else {
+              // CAPTCHA was solved — fall through to submit below
+              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — auto-submit — submitting after CAPTCHA solve on ${target}` });
+              await inquiryCheckpoint(args.licenseId);
+              let captchaSubmitResponse: Response;
+              try {
+                captchaSubmitResponse = await withTargetWatchdog({
+                  licenseId: args.licenseId,
+                  runId: args.runId,
+                  sessionId: args.sessionId,
+                  target,
+                  index: i,
+                  total: args.targets.length,
+                  phase: 'submit',
+                  timeoutMs: 35_000,
+                  task: submitInquiry(requestFor(args.licenseId, '/api/inquiry/submit', {
+                    sessionId: args.sessionId,
+                    runId: args.runId,
+                  })),
+                });
+              } catch (error) {
+                assertWorkerActive(args.licenseId, args.runId);
+                if (error instanceof InquiryTargetTimeoutError) {
+                  addInquiryResult({
+                    licenseId: args.licenseId,
+                    runId: args.runId,
+                    sessionId: args.sessionId,
+                    status: 'review',
+                    target,
+                    contactUrl: prepared.contactUrl || target,
+                    reason: `Submission did not reach a reliable terminal state within ${Math.round(error.timeoutMs / 1000)} seconds.`,
+                  });
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — submission timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically` });
+                  continue;
+                }
+                throw error;
+              }
+              assertWorkerActive(args.licenseId, args.runId);
+              const captchaSubmitted = await responseJson(captchaSubmitResponse);
+              assertWorkerActive(args.licenseId, args.runId);
+              if (captchaSubmitResponse.ok && captchaSubmitted?.success) {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — submission confirmed on ${captchaSubmitted.currentUrl || prepared.contactUrl || target}${captchaSubmitted.confirmation ? ` — ${captchaSubmitted.confirmation}` : ''}` });
+              } else if (captchaSubmitted?.captchaDetected) {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA still present after solve attempt on ${target}; saved and skipped automatically` });
+              } else if (captchaSubmitted?.reviewRequired) {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — ${captchaSubmitted.reason || captchaSubmitted.error || 'manual interaction needed'}; saved and skipped automatically` });
+              } else {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'error', message: `${i + 1}/${args.targets.length} — ${target} — submit after CAPTCHA solve failed: ${captchaSubmitted?.error || `HTTP ${captchaSubmitResponse.status}`}` });
+              }
+            }
           } else if (classification === 'review_required') {
             addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${prepared.contactUrl || target} — ${prepared.reviewReason || 'manual interaction needed'}; saved and skipped automatically` });
           } else if (classification === 'site_unavailable') {
@@ -226,7 +300,28 @@ export function startInquiryBackendWorker(args: {
             if (submitResponse.ok && submitted?.success) {
               addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — submission confirmed on ${submitted.currentUrl || prepared.contactUrl || target}${submitted.confirmation ? ` — ${submitted.confirmation}` : ''}` });
             } else if (submitted?.captchaDetected) {
-              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; saved and skipped automatically` });
+              // Post-submit CAPTCHA detected — attempt to solve and retry
+              let postCaptchaSolved = false;
+              try {
+                const session = await getInquirySession(args.sessionId, args.licenseId);
+                if (session) {
+                  addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — CAPTCHA appeared after submit on ${target}; attempting to solve` });
+                  const captchaHandler = new InquiryCaptchaHandler(args.licenseId, args.runId);
+                  const postResult = await captchaHandler.checkPostSubmitCaptcha(session.page);
+                  if (postResult.detected) {
+                    const solveResult = await captchaHandler.handleCaptcha(session.page);
+                    if (solveResult.handled && solveResult.status === 'solved') {
+                      addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — post-submit CAPTCHA solved on ${target}` });
+                      postCaptchaSolved = true;
+                    }
+                  }
+                }
+              } catch {
+                // Solving failure must not stop the campaign
+              }
+              if (!postCaptchaSolved) {
+                addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; saved and skipped automatically` });
+              }
             } else if (submitted?.reviewRequired) {
               addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — ${submitted.reason || submitted.error || 'manual interaction needed'}; saved and skipped automatically` });
             } else {
