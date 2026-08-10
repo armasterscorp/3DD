@@ -503,12 +503,14 @@ async function detectCaptcha(page: any, form?: any): Promise<{ detected: boolean
     // has enough dimensions for a user to interact with it.
     const interactiveWidget = box.width >= 160 && box.height >= 45;
     if (interactiveWidget) {
+      const combined = `${src} ${titleAttr}`;
       return {
         detected: true,
         provider:
-          /hcaptcha/i.test(`${src} ${titleAttr}`) ? 'hCaptcha' :
-          /cloudflare|turnstile/i.test(`${src} ${titleAttr}`) ? 'Cloudflare Turnstile' :
-          'reCAPTCHA',
+          /recaptcha/i.test(combined) ? 'reCAPTCHA' :
+          /hcaptcha/i.test(combined) ? 'hCaptcha' :
+          /cloudflare|turnstile/i.test(combined) ? 'Cloudflare Turnstile' :
+          'Unknown CAPTCHA / Human Verification',
       };
     }
   }
@@ -858,9 +860,15 @@ export async function POST(request: NextRequest) {
     const { page } = session;
     const savedApiKey = getUserApiKey(licenseId);
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
-    const solvePreloadCaptcha = async () => {
-      if (!captchaHandler) return { status: 'unconfigured' as const };
-      addInquiryLog({ licenseId, runId, level: 'info', message: `attempting to solve pre-load CAPTCHA on ${target}` });
+    // Attempt automated CAPTCHA solve on the current page. Returns the solve result.
+    // context is a short label used in logs to indicate where detection is happening.
+    const attemptAutoSolve = async (context: string): Promise<{ status: 'solved' | 'failed' | 'not_found' | 'unconfigured'; error?: string }> => {
+      const currentUrl = page.url();
+      addInquiryLog({ licenseId, runId, level: 'info', message: `checking CAPTCHA on ${context}: ${currentUrl}` });
+      if (!captchaHandler) {
+        addInquiryLog({ licenseId, runId, level: 'info', message: `no CAPTCHA detected on ${context} (solver not configured)` });
+        return { status: 'unconfigured' };
+      }
       try {
         const result = await Promise.race([
           captchaHandler.handleCaptcha(page),
@@ -869,21 +877,17 @@ export async function POST(request: NextRequest) {
           ),
         ]);
         if (result.status === 'solved') {
-          addInquiryLog({ licenseId, runId, level: 'success', message: '✓ CAPTCHA solved' });
+          addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA solved on ${context}: ${currentUrl}` });
         } else if (result.status === 'not_found') {
-          addInquiryLog({ licenseId, runId, level: 'info', message: 'no CAPTCHA detected' });
+          addInquiryLog({ licenseId, runId, level: 'info', message: `no CAPTCHA detected on ${context}: ${currentUrl}` });
         } else if (result.status === 'failed') {
-          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed on ${context}: ${currentUrl}${result.error ? ` (${result.error})` : ''}` });
         }
         return result;
       } catch (error) {
-        addInquiryLog({
-          licenseId,
-          runId,
-          level: 'warning',
-          message: `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`,
-        });
-        return { handled: false, status: 'failed' as const };
+        const msg = error instanceof Error ? error.message : String(error);
+        addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed on ${context}: ${currentUrl} (${msg})` });
+        return { handled: false, status: 'failed' as const, error: msg } as any;
       }
     };
 
@@ -893,11 +897,12 @@ export async function POST(request: NextRequest) {
       // page before discovery can immediately navigate elsewhere or classify it.
       await visualActionPause(page, 900);
       await inquiryCheckpoint(licenseId);
-      await solvePreloadCaptcha();
+      // Step 1: detect/log CAPTCHA state on homepage and attempt automated solve.
+      await attemptAutoSolve('homepage');
     } catch (navigationError) {
       const challenge = await detectCaptcha(page);
       if (challenge.detected) {
-        await solvePreloadCaptcha();
+        await attemptAutoSolve('homepage');
       }
       if (isUnavailableNavigationError(navigationError)) {
         addInquiryResult({ licenseId, runId, sessionId, status: 'failed', target, contactUrl: page.url() || target, reason: shortUnavailableReason(navigationError), values: profile as Record<string, unknown> });
@@ -917,12 +922,15 @@ export async function POST(request: NextRequest) {
     await page.waitForTimeout(400);
     await inquiryCheckpoint(licenseId);
 
-    const pageCaptcha = await detectCaptcha(page);
-    if (pageCaptcha.detected) {
-      await solvePreloadCaptcha();
+    // Re-check homepage after any solve attempt, then discover the contact page.
+    const homepageCaptcha = await detectCaptcha(page);
+    if (homepageCaptcha.detected) {
+      // Second solve attempt on homepage if still blocked.
+      await attemptAutoSolve('homepage (retry)');
     }
 
     await inquiryCheckpoint(licenseId);
+    // Step 2: discover contact/quote/inquiry page.
     let discovery;
     try {
       discovery = await findContactPageAndForm(page);
@@ -946,24 +954,57 @@ export async function POST(request: NextRequest) {
       throw error;
     }
 
-    const captcha = await detectCaptcha(page, discovery.form);
-    if (captcha.detected) {
-      session.targetUrl = target;
-      session.contactUrl = discovery.contactUrl;
-      session.lastPreparedAt = new Date().toISOString();
-      addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discovery.contactUrl, captchaProvider: captcha.provider || 'CAPTCHA', reason: 'CAPTCHA detected on inquiry form', values: profile as Record<string, unknown> });
-      await visualActionPause(page, 2200);
-      return NextResponse.json({
-        success: true,
-        classification: 'captcha',
-        target,
-        contactUrl: discovery.contactUrl,
-        currentUrl: page.url(),
-        discovery: discovery.discovery,
-        captchaDetected: true,
-        captchaProvider: captcha.provider || 'CAPTCHA',
-        detected: [], extras: [], submitVisible: false, fieldCount: 0,
-      });
+    // Step 3: detect/log CAPTCHA state on the contact form URL (may differ from homepage).
+    // Always attempt an automated solve here; if unresolved, classify and skip quickly.
+    const contactPageCaptcha = await detectCaptcha(page, discovery.form);
+    if (contactPageCaptcha.detected) {
+      const contactUrl = page.url();
+      addInquiryLog({ licenseId, runId, level: 'info', message: `CAPTCHA detected on contact form: ${contactUrl} (${contactPageCaptcha.provider || 'Unknown CAPTCHA / Human Verification'}) — attempting automated solve` });
+      const solveResult = await attemptAutoSolve('contact form');
+      if (solveResult.status !== 'solved') {
+        // Auto-solve failed or timed out — classify and skip, do not block pipeline.
+        const provider = contactPageCaptcha.provider || 'Unknown CAPTCHA / Human Verification';
+        addInquiryLog({ licenseId, runId, level: 'warning', message: `CAPTCHA unresolved on contact form: ${contactUrl} (${provider}) — skipping target` });
+        session.targetUrl = target;
+        session.contactUrl = discovery.contactUrl;
+        session.lastPreparedAt = new Date().toISOString();
+        addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discovery.contactUrl, captchaProvider: provider, reason: 'CAPTCHA detected on inquiry form (auto-solve failed)', values: profile as Record<string, unknown> });
+        await visualActionPause(page, 2200);
+        return NextResponse.json({
+          success: true,
+          classification: 'captcha',
+          target,
+          contactUrl: discovery.contactUrl,
+          currentUrl: page.url(),
+          discovery: discovery.discovery,
+          captchaDetected: true,
+          captchaProvider: provider,
+          detected: [], extras: [], submitVisible: false, fieldCount: 0,
+        });
+      }
+      // Solve succeeded — re-check to confirm CAPTCHA is cleared before proceeding.
+      const recheck = await detectCaptcha(page, discovery.form);
+      if (recheck.detected) {
+        const provider = recheck.provider || 'Unknown CAPTCHA / Human Verification';
+        addInquiryLog({ licenseId, runId, level: 'warning', message: `CAPTCHA still present after solve attempt on contact form: ${contactUrl} (${provider}) — skipping target` });
+        session.targetUrl = target;
+        session.contactUrl = discovery.contactUrl;
+        session.lastPreparedAt = new Date().toISOString();
+        addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discovery.contactUrl, captchaProvider: provider, reason: 'CAPTCHA still present after auto-solve attempt', values: profile as Record<string, unknown> });
+        await visualActionPause(page, 2200);
+        return NextResponse.json({
+          success: true,
+          classification: 'captcha',
+          target,
+          contactUrl: discovery.contactUrl,
+          currentUrl: page.url(),
+          discovery: discovery.discovery,
+          captchaDetected: true,
+          captchaProvider: provider,
+          detected: [], extras: [], submitVisible: false, fieldCount: 0,
+        });
+      }
+      addInquiryLog({ licenseId, runId, level: 'success', message: `CAPTCHA cleared on contact form: ${contactUrl} — continuing` });
     }
 
     await inquiryCheckpoint(licenseId);
