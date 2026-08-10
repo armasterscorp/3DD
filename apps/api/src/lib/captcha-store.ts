@@ -1,6 +1,4 @@
-import { PrismaClient } from '@3d-suite/db';
-
-const prisma = new PrismaClient();
+import { prisma } from '@/lib/prisma';
 
 export class CaptchaStore {
   /**
