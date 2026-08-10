@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-store';
 import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
-import { getUserApiKey } from '@/lib/captcha-solver';
+import { resolveUserApiKey } from '@/lib/captcha-solver';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
+import {
+  getCaptchaSolveTimeoutMs,
+  hasFreshCaptchaToken,
+  readCaptchaTokenSnapshot,
+} from '@/lib/inquiry-captcha-utils';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -484,6 +489,11 @@ async function detectCaptcha(page: any, form?: any): Promise<{ detected: boolean
     return { detected: true, provider };
   }
 
+  const tokenState = await readCaptchaTokenSnapshot(page);
+  if (hasFreshCaptchaToken(tokenState)) {
+    return { detected: false };
+  }
+
   // Detect an actual visible checkbox-style challenge below/inside the form.
   // Normal reCAPTCHA/hCaptcha checkbox widgets are roughly a few hundred pixels
   // wide, whereas badges/invisible response frames are tiny or hidden.
@@ -856,16 +866,30 @@ export async function POST(request: NextRequest) {
     session.runId = runId;
     session.licenseId = licenseId;
     const { page } = session;
-    const savedApiKey = getUserApiKey(licenseId);
+    const savedApiKey = await resolveUserApiKey(licenseId);
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    const captchaSolveTimeoutMs = getCaptchaSolveTimeoutMs();
     const solvePreloadCaptcha = async () => {
       if (!captchaHandler) return { status: 'unconfigured' as const };
+      const existingToken = await readCaptchaTokenSnapshot(page);
+      if (hasFreshCaptchaToken(existingToken)) {
+        addInquiryLog({ licenseId, runId, level: 'info', message: `reusing solved CAPTCHA token on ${target}` });
+        return { handled: true, status: 'solved' as const, solution: 'cached-token' };
+      }
       addInquiryLog({ licenseId, runId, level: 'info', message: `attempting to solve pre-load CAPTCHA on ${target}` });
       try {
         const result = await Promise.race([
           captchaHandler.handleCaptcha(page),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
-            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 5 seconds' }), 5_000)
+            setTimeout(
+              () =>
+                resolve({
+                  handled: false,
+                  status: 'failed',
+                  error: `timeout after ${Math.round(captchaSolveTimeoutMs / 1000)} seconds`,
+                }),
+              captchaSolveTimeoutMs
+            )
           ),
         ]);
         if (result.status === 'solved') {

@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-store';
 import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
-import { getUserApiKey } from '@/lib/captcha-solver';
+import { resolveUserApiKey } from '@/lib/captcha-solver';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
+import {
+  getCaptchaSolveTimeoutMs,
+  hasFreshCaptchaToken,
+  readCaptchaTokenSnapshot,
+} from '@/lib/inquiry-captcha-utils';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -278,6 +283,13 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     };
   }
 
+  const tokenState = await readCaptchaTokenSnapshot(page);
+  if (!hasFreshCaptchaToken(tokenState)) {
+    // continue with visible-widget / error-node detection below
+  } else {
+    return { detected: false };
+  }
+
   // Visible checkbox-style provider widget counts as a blocking CAPTCHA.
   const frames = page.locator(
     'iframe[src*="recaptcha/api2/anchor" i], iframe[title*="recaptcha" i], iframe[src*="hcaptcha" i], iframe[title*="hcaptcha" i], iframe[src*="turnstile" i], iframe[src*="challenges.cloudflare.com" i]'
@@ -352,16 +364,30 @@ export async function POST(request: NextRequest) {
       const result = addInquiryResult({ licenseId, runId, sessionId, status: 'review', target, contactUrl: page.url(), reason, values: session.profile || {} });
       return NextResponse.json({ success: false, reviewRequired: true, reason, resultId: result.id, steps }, { status: 409 });
     };
-    const savedApiKey = getUserApiKey(licenseId);
+    const savedApiKey = await resolveUserApiKey(licenseId);
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    const captchaSolveTimeoutMs = getCaptchaSolveTimeoutMs();
     const solveCaptchaWithTimeout = async (message: string) => {
       if (!captchaHandler) return { status: 'unconfigured' as const };
+      const existingToken = await readCaptchaTokenSnapshot(page);
+      if (hasFreshCaptchaToken(existingToken)) {
+        addInquiryLog({ licenseId, runId, level: 'info', message: 'reusing solved CAPTCHA token before submission' });
+        return { handled: true, status: 'solved' as const, solution: 'cached-token' };
+      }
       addInquiryLog({ licenseId, runId, level: 'info', message });
       try {
         const result = await Promise.race([
           captchaHandler.handleCaptcha(page),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
-            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 5 seconds' }), 5_000)
+            setTimeout(
+              () =>
+                resolve({
+                  handled: false,
+                  status: 'failed',
+                  error: `timeout after ${Math.round(captchaSolveTimeoutMs / 1000)} seconds`,
+                }),
+              captchaSolveTimeoutMs
+            )
           ),
         ]);
         if (result.status === 'solved') {

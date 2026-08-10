@@ -3,6 +3,7 @@ import { POST as prepareInquiry } from '@/app/api/inquiry/prepare/route';
 import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
 import { addInquiryLog, addInquiryResult, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError, setInquiryRunState } from '@/lib/inquiry-run-store';
 import { closeInquirySession } from '@/lib/inquiry-browser-store';
+import { getInquiryPhaseTimeoutMs } from '@/lib/inquiry-captcha-utils';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -133,7 +134,7 @@ export function startInquiryBackendWorker(args: {
             index: i,
             total: args.targets.length,
             phase: 'prepare',
-            timeoutMs: 75_000,
+            timeoutMs: getInquiryPhaseTimeoutMs('prepare'),
             task: prepareInquiry(requestFor(args.licenseId, '/api/inquiry/prepare', {
               sessionId: args.sessionId,
               runId: args.runId,
@@ -191,7 +192,7 @@ export function startInquiryBackendWorker(args: {
                 index: i,
                 total: args.targets.length,
                 phase: 'submit',
-                timeoutMs: 35_000,
+                timeoutMs: getInquiryPhaseTimeoutMs('submit'),
                 task: submitInquiry(requestFor(args.licenseId, '/api/inquiry/submit', {
                   sessionId: args.sessionId,
                   runId: args.runId,

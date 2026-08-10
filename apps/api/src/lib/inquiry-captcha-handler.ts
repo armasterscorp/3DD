@@ -230,6 +230,7 @@ export class InquiryCaptchaHandler {
     solution?: string;
     error?: string;
   }> {
+    let queueId = '';
     try {
       if (!this.solver) {
         throw new Error('Solver not configured');
@@ -242,6 +243,7 @@ export class InquiryCaptchaHandler {
         captchaType: 'reCAPTCHA v2',
         siteKey: captcha.siteKey,
       });
+      queueId = queued.id;
       await CaptchaStore.updateCaptchaQueue(queued.id, {
         status: 'solving',
         attempts: 1,
@@ -261,6 +263,12 @@ export class InquiryCaptchaHandler {
       console.log('[Inquiry CAPTCHA] reCAPTCHA v2 solved and injected');
       return { handled: true, status: 'solved', solution: token };
     } catch (error: any) {
+      if (queueId) {
+        await CaptchaStore.updateCaptchaQueue(queueId, {
+          status: 'failed',
+          error: error.message,
+        }).catch(() => undefined);
+      }
       console.error('[Inquiry CAPTCHA] reCAPTCHA v2 solving failed:', error.message);
       return {
         handled: false,
@@ -279,6 +287,7 @@ export class InquiryCaptchaHandler {
     solution?: string;
     error?: string;
   }> {
+    let queueId = '';
     try {
       if (!this.solver) {
         throw new Error('Solver not configured');
@@ -292,6 +301,7 @@ export class InquiryCaptchaHandler {
         siteKey: captcha.siteKey,
         minScore: captcha.minScore,
       });
+      queueId = queued.id;
       await CaptchaStore.updateCaptchaQueue(queued.id, {
         status: 'solving',
         attempts: 1,
@@ -315,6 +325,12 @@ export class InquiryCaptchaHandler {
       console.log('[Inquiry CAPTCHA] reCAPTCHA v3 solved and injected');
       return { handled: true, status: 'solved', solution: token };
     } catch (error: any) {
+      if (queueId) {
+        await CaptchaStore.updateCaptchaQueue(queueId, {
+          status: 'failed',
+          error: error.message,
+        }).catch(() => undefined);
+      }
       console.error('[Inquiry CAPTCHA] reCAPTCHA v3 solving failed:', error.message);
       return {
         handled: false,
@@ -333,6 +349,7 @@ export class InquiryCaptchaHandler {
     solution?: string;
     error?: string;
   }> {
+    let queueId = '';
     try {
       if (!this.solver) {
         throw new Error('Solver not configured');
@@ -345,6 +362,7 @@ export class InquiryCaptchaHandler {
         captchaType: 'Cloudflare Turnstile',
         websiteKey: captcha.siteKey,
       });
+      queueId = queued.id;
       await CaptchaStore.updateCaptchaQueue(queued.id, {
         status: 'solving',
         attempts: 1,
@@ -364,6 +382,12 @@ export class InquiryCaptchaHandler {
       console.log('[Inquiry CAPTCHA] Cloudflare Turnstile solved and injected');
       return { handled: true, status: 'solved', solution: token };
     } catch (error: any) {
+      if (queueId) {
+        await CaptchaStore.updateCaptchaQueue(queueId, {
+          status: 'failed',
+          error: error.message,
+        }).catch(() => undefined);
+      }
       console.error('[Inquiry CAPTCHA] Turnstile solving failed:', error.message);
       return {
         handled: false,
@@ -382,6 +406,7 @@ export class InquiryCaptchaHandler {
     solution?: string;
     error?: string;
   }> {
+    let queueId = '';
     try {
       if (!this.solver) {
         throw new Error('Solver not configured');
@@ -394,6 +419,7 @@ export class InquiryCaptchaHandler {
         captchaType: 'hCaptcha',
         siteKey: captcha.siteKey,
       });
+      queueId = queued.id;
       await CaptchaStore.updateCaptchaQueue(queued.id, {
         status: 'solving',
         attempts: 1,
@@ -413,6 +439,12 @@ export class InquiryCaptchaHandler {
       console.log('[Inquiry CAPTCHA] hCaptcha solved and injected');
       return { handled: true, status: 'solved', solution: token };
     } catch (error: any) {
+      if (queueId) {
+        await CaptchaStore.updateCaptchaQueue(queueId, {
+          status: 'failed',
+          error: error.message,
+        }).catch(() => undefined);
+      }
       console.error('[Inquiry CAPTCHA] hCaptcha solving failed:', error.message);
       return {
         handled: false,
