@@ -139,21 +139,33 @@ export class InquiryCaptchaHandler {
       const provider = await page.evaluate((): string | null => {
         const scripts = Array.from(document.querySelectorAll('script')).map((s: any) => String(s.src || ''));
         const iframes = Array.from(document.querySelectorAll('iframe')).map((f: any) => String(f.src || ''));
-        const joined = `${scripts.join(' ')} ${iframes.join(' ')}`.toLowerCase();
+        const allSrcs = [...scripts, ...iframes];
+
+        const hostOf = (url: string): string => {
+          try { return new URL(url).hostname; } catch { return ''; }
+        };
+        const isHcaptchaHost = (url: string) => {
+          const h = hostOf(url);
+          return h === 'hcaptcha.com' || h.endsWith('.hcaptcha.com');
+        };
+        const isCloudflareChallengeHost = (url: string) => {
+          const h = hostOf(url);
+          return h === 'challenges.cloudflare.com';
+        };
 
         // Turnstile: standalone widget or full challenge iframe.
         if (
           document.querySelector('.cf-turnstile, [data-cf-turnstile], input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')
         ) return 'turnstile_standalone';
         if (
-          joined.includes('challenges.cloudflare.com/cdn-cgi/challenge-platform') ||
+          allSrcs.some(isCloudflareChallengeHost) ||
           document.querySelector('iframe[src*="challenges.cloudflare.com"]')
         ) return 'turnstile_challenge';
 
         // hCaptcha
         if (
           document.querySelector('.h-captcha, [data-hcaptcha-widget-id], input[name="h-captcha-response"], textarea[name="h-captcha-response"]') ||
-          joined.includes('hcaptcha.com')
+          allSrcs.some(isHcaptchaHost)
         ) return 'hcaptcha';
 
         // reCAPTCHA – must have an actual visible widget or response field, not
@@ -244,7 +256,12 @@ export class InquiryCaptchaHandler {
         }
 
         const hasHcaptchaScript = Array.from(document.querySelectorAll('script')).some(
-          (s: any) => String(s.src || '').includes('hcaptcha.com')
+          (s: any) => {
+            try {
+              const h = new URL(String(s.src || '')).hostname;
+              return h === 'hcaptcha.com' || h.endsWith('.hcaptcha.com');
+            } catch { return false; }
+          }
         );
         if (hasHcaptchaScript) {
           const generic = document.querySelector('[data-sitekey]');
