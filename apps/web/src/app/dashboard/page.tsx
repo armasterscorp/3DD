@@ -3951,6 +3951,10 @@ type InquiryResultRow = {
   target: string;
   contactUrl?: string;
   reason?: string;
+  primaryReason?: string;
+  failureDetail?: string;
+  captchaDetected?: boolean;
+  captchaType?: string;
   captchaProvider?: string;
   values?: Record<string, unknown>;
   createdAt: string;

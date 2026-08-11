@@ -96,4 +96,61 @@ describe('inquiry backend worker', () => {
     expect(runLogs.filter((item) => item.message.includes('checking '))).toHaveLength(0);
     clearInquiryRunContext(licenseId, runId);
   });
+
+  it('keeps submit exceptions in captcha namespace once captcha was detected', async () => {
+    const licenseId = 'worker-c';
+    const runId = `run-worker-c-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = 'sessionccc';
+    const targets = ['captcha-submit-error.example.com'];
+
+    prepareMock.mockResolvedValue(Response.json({
+      success: true,
+      classification: 'form_found',
+      captchaDetected: true,
+      captchaClassificationLocked: true,
+      captchaType: 'reCAPTCHA',
+      captchaProvider: 'reCAPTCHA',
+      contactUrl: 'https://captcha-submit-error.example.com/contact',
+    }));
+    submitMock.mockResolvedValue(new Response(JSON.stringify({ success: false, error: 'submit exploded' }), { status: 500 }));
+
+    createInquiryRunContext(licenseId, runId);
+    setInquiryRunState(licenseId, 'running', { runId, sessionId, targets, totalTargets: 1, index: 0, currentTarget: targets[0] });
+    startInquiryBackendWorker({ licenseId, runId, sessionId, targets, startIndex: 0, profile: {} });
+
+    await flushRun(licenseId, 'complete');
+
+    const { runResults, runLogs } = getInquiryResults(licenseId, runId);
+    expect(runResults[0]?.status).toBe('captcha');
+    expect(runResults[0]?.primaryReason).toBe('captcha_solver_failed');
+    expect(runResults[0]?.failureDetail).toBe('submit exploded');
+    expect(runLogs.some((item) => item.message.includes('[captcha_solver_failed]'))).toBe(true);
+  });
+
+  it('keeps non-captcha submit errors in the non-captcha failure namespace', async () => {
+    const licenseId = 'worker-d';
+    const runId = `run-worker-d-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = 'sessionddd';
+    const targets = ['plain-submit-error.example.com'];
+
+    prepareMock.mockResolvedValue(Response.json({
+      success: true,
+      classification: 'form_found',
+      captchaDetected: false,
+      contactUrl: 'https://plain-submit-error.example.com/contact',
+    }));
+    submitMock.mockResolvedValue(new Response(JSON.stringify({ success: false, error: 'plain submit failure' }), { status: 500 }));
+
+    createInquiryRunContext(licenseId, runId);
+    setInquiryRunState(licenseId, 'running', { runId, sessionId, targets, totalTargets: 1, index: 0, currentTarget: targets[0] });
+    startInquiryBackendWorker({ licenseId, runId, sessionId, targets, startIndex: 0, profile: {} });
+
+    await flushRun(licenseId, 'complete');
+
+    const { runResults, runLogs } = getInquiryResults(licenseId, runId);
+    expect(runResults[0]?.status).toBe('failed');
+    expect(runResults[0]?.primaryReason).toBe('submit_failed');
+    expect(runResults[0]?.failureDetail).toBe('plain submit failure');
+    expect(runLogs.some((item) => item.message.includes('[submit_failed]'))).toBe(true);
+  });
 });

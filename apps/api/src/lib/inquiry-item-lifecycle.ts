@@ -30,8 +30,12 @@ export type InquiryTerminalState = Extract<
 
 export type InquiryTerminalReasonCode =
   | 'no_form_found'
-  | 'captcha_required_unsolved'
+  | 'captcha_solved'
+  | 'captcha_unsolved_after_token'
+  | 'captcha_solver_timeout'
+  | 'captcha_solver_failed'
   | 'captcha_detected_autoskip'
+  | 'captcha_required_manual_review'
   | 'scan_timeout'
   | 'submit_timeout'
   | 'submit_failed'
@@ -57,6 +61,9 @@ type StoredAttempt = InquiryAttemptRef & {
   terminalState?: InquiryTerminalState;
   terminalReason?: string;
   terminalReasonCode?: InquiryTerminalReasonCode;
+  captchaDetected?: boolean;
+  captchaClassificationLocked?: boolean;
+  captchaType?: string;
   terminalEmitted: boolean;
   controllers: Record<InquiryOperationKind, AbortController>;
   timers: Set<NodeJS.Timeout>;
@@ -176,6 +183,8 @@ export function startInquiryItemAttempt(input: Omit<InquiryAttemptRef, 'attemptI
     createdAt: now,
     updatedAt: now,
     terminalEmitted: false,
+    captchaDetected: false,
+    captchaClassificationLocked: false,
     controllers: buildControllerBag(),
     timers: new Set<NodeJS.Timeout>(),
     invalidTransitionDebugKeys: new Set<string>(),
@@ -321,6 +330,16 @@ export function emitInquiryItemTerminal(
         current,
         `[debug] invalid terminal transition ignored item=${current.index + 1} attempt=${current.attemptId} from=${current.state} to=${terminalState}`
       );
+    }
+
+    export function markInquiryItemCaptchaDetected(ref: InquiryAttemptRef, captchaType?: string): boolean {
+      const current = currentFor(ref);
+      if (!current) return false;
+      current.captchaDetected = true;
+      current.captchaClassificationLocked = true;
+      if (captchaType) current.captchaType = captchaType;
+      current.updatedAt = new Date().toISOString();
+      return true;
     }
     return false;
   }

@@ -7,10 +7,18 @@ import {
   formatAttemptStep,
   getInquiryItemAttempt,
   isActiveInquiryItemAttempt,
+  markInquiryItemCaptchaDetected,
   renewInquiryItemOperation,
   type InquiryAttemptRef,
 } from '@/lib/inquiry-item-lifecycle';
-import { classifyCaptchaAfterToken, shouldAttemptPreSubmitCaptchaSolve } from '@/lib/inquiry-submit-captcha-policy';
+import {
+  classifyCaptchaAfterToken,
+  createCaptchaClassificationState,
+  lockCaptchaClassification,
+  mapCaptchaTerminalReason,
+  markCaptchaSolved,
+  shouldAttemptPreSubmitCaptchaSolve,
+} from '@/lib/inquiry-submit-captcha-policy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -364,6 +372,7 @@ export async function POST(request: NextRequest) {
   let sessionId = '';
   let runId = '';
   let target = '';
+  const captchaState = createCaptchaClassificationState();
   try {
     const body = await request.json();
     sessionId = cleanInquirySessionId(body.sessionId);
@@ -422,14 +431,72 @@ export async function POST(request: NextRequest) {
     const page = session.page;
     const steps: string[] = [];
     let lastLabel = '';
-
-    const saveReview = (reason: string) => {
-      const result = storeResult({ status: 'review', contactUrl: page.url(), reason, values: session.profile || {} });
-      return NextResponse.json({ success: false, reviewRequired: true, reason, resultId: result?.id, steps }, { status: 409 });
+    const lockCaptcha = (provider?: string) => {
+      lockCaptchaClassification(captchaState, provider);
+      if (attemptRef) markInquiryItemCaptchaDetected(attemptRef, provider);
     };
-    const saveCaptcha = (provider: string, reason: string) => {
-      const result = storeResult({ status: 'captcha', contactUrl: page.url(), captchaProvider: provider || 'CAPTCHA', reason, values: session.profile || {} });
-      return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: provider || 'CAPTCHA', error: reason, resultId: result?.id, steps }, { status: 409 });
+
+    const saveReview = (reason: string, failureDetail = reason, provider?: string) => {
+      const primaryReason = mapCaptchaTerminalReason({
+        captchaDetected: captchaState.captchaDetected,
+        captchaClassificationLocked: captchaState.captchaClassificationLocked,
+        tokenReturned: captchaState.tokenReturned,
+        captchaStillPresent: true,
+        solverTimedOut: failureDetail === 'captcha_timeout_after_75_seconds',
+        solverFailed: !captchaState.solveCompleted,
+        manualReview: true,
+      });
+      const result = storeResult({
+        status: primaryReason ? 'captcha' : 'review',
+        contactUrl: page.url(),
+        reason,
+        primaryReason: primaryReason || 'submit_failed',
+        failureDetail,
+        captchaDetected: primaryReason ? true : undefined,
+        captchaType: provider || captchaState.captchaType,
+        captchaProvider: provider || captchaState.captchaType,
+        values: session.profile || {},
+      });
+      return NextResponse.json({
+        success: false,
+        reviewRequired: !primaryReason,
+        captchaDetected: !!primaryReason,
+        captchaClassificationLocked: !!primaryReason,
+        captchaProvider: primaryReason ? (provider || captchaState.captchaType || 'CAPTCHA') : undefined,
+        captchaType: primaryReason ? (provider || captchaState.captchaType || 'CAPTCHA') : undefined,
+        primaryReason: primaryReason || 'submit_failed',
+        failureDetail,
+        reason,
+        error: reason,
+        resultId: result?.id,
+        steps,
+      }, { status: 409 });
+    };
+    const saveCaptcha = (provider: string, reason: string, primaryReason = 'captcha_detected_autoskip', failureDetail = reason) => {
+      lockCaptcha(provider);
+      const result = storeResult({
+        status: 'captcha',
+        contactUrl: page.url(),
+        captchaProvider: provider || 'CAPTCHA',
+        captchaDetected: true,
+        captchaType: provider || 'CAPTCHA',
+        primaryReason,
+        failureDetail,
+        reason,
+        values: session.profile || {},
+      });
+      return NextResponse.json({
+        success: false,
+        captchaDetected: true,
+        captchaClassificationLocked: true,
+        captchaProvider: provider || 'CAPTCHA',
+        captchaType: provider || 'CAPTCHA',
+        primaryReason,
+        failureDetail,
+        error: reason,
+        resultId: result?.id,
+        steps,
+      }, { status: 409 });
     };
     const captchaConfig = await CaptchaStore.getCaptchaConfig(licenseId);
     const savedApiKey = captchaConfig?.isActive ? captchaConfig.apiKey : '';
@@ -449,6 +516,7 @@ export async function POST(request: NextRequest) {
       if (!activeForm) return { handled: false, status: 'not_found' as const };
       const snapshot = attemptRef ? getInquiryItemAttempt(attemptRef) : null;
       const activeFormCaptcha = await detectCaptcha(page, activeForm);
+      if (activeFormCaptcha.detected) lockCaptcha(activeFormCaptcha.provider);
       const shouldSolve = shouldAttemptPreSubmitCaptchaSolve({
         captchaDetected: activeFormCaptcha.detected,
         hasActiveTargetForm: !!activeForm,
@@ -483,6 +551,7 @@ export async function POST(request: NextRequest) {
             log('warning', `CAPTCHA solution returned, but ${stillRequired.provider || 'CAPTCHA'} is still required on ${String(page.url?.() || '')}`);
             return { handled: false, status: 'failed' as const, error: 'captcha_unsolved_after_token' };
           } else {
+            markCaptchaSolved(captchaState, activeFormCaptcha.provider);
             log('success', `✓ CAPTCHA cleared on ${String(page.url?.() || '')}`);
           }
         } else if (result.status === 'failed') {
@@ -535,7 +604,12 @@ export async function POST(request: NextRequest) {
         const solvedPreSubmit = await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission', chosen);
         const tokenClassification = classifyCaptchaAfterToken(solvedPreSubmit.status === 'failed' && solvedPreSubmit.error === 'captcha_unsolved_after_token');
         if (tokenClassification.reviewRequired) {
-          return saveReview(tokenClassification.reasonCode || 'captcha_unsolved_after_token');
+          return saveCaptcha(
+            captchaBeforeSubmit.provider || captchaState.captchaType || 'CAPTCHA',
+            'CAPTCHA token returned but the challenge is still required before submit',
+            tokenClassification.reasonCode || 'captcha_unsolved_after_token',
+            'captcha_unsolved_after_token'
+          );
         }
       }
       const captcha = await detectCaptcha(page, chosen);
@@ -543,7 +617,7 @@ export async function POST(request: NextRequest) {
         const provider = captcha.provider || 'CAPTCHA';
         const reason = `CAPTCHA detected before the submit action (${provider}).`;
         log('warning', `⚠ ${reason} Saved as CAPTCHA and skipped; Submit was not clicked.`);
-        return saveCaptcha(provider, reason);
+        return saveCaptcha(provider, reason, 'captcha_detected_autoskip', 'captcha_still_present_before_submit');
       }
 
       const submit = await findSubmitControl(chosen);
@@ -597,14 +671,25 @@ export async function POST(request: NextRequest) {
         if (captchaHandler) {
           const postSubmitCaptcha = await captchaHandler.checkPostSubmitCaptcha(page);
           if (postSubmitCaptcha.detected) {
+            lockCaptcha(postSubmitCaptcha.type || captchaState.captchaType || 'CAPTCHA');
             const solvedPostSubmit = await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve', chosen);
             const tokenClassification = classifyCaptchaAfterToken(solvedPostSubmit.status === 'failed' && solvedPostSubmit.error === 'captcha_unsolved_after_token');
             if (tokenClassification.reviewRequired) {
-              return saveReview(tokenClassification.reasonCode || 'captcha_unsolved_after_token');
+              return saveCaptcha(
+                postSubmitCaptcha.type || captchaState.captchaType || 'CAPTCHA',
+                'CAPTCHA token returned but the challenge is still required after submit',
+                tokenClassification.reasonCode || 'captcha_unsolved_after_token',
+                'captcha_unsolved_after_token'
+              );
             }
             const unresolvedPostSubmit = await detectCaptcha(page, page.locator('body'));
             if (unresolvedPostSubmit.detected) {
-              return saveReview('captcha_unsolved_after_token');
+              return saveCaptcha(
+                unresolvedPostSubmit.provider || postSubmitCaptcha.type || captchaState.captchaType || 'CAPTCHA',
+                'CAPTCHA remained visible after submit',
+                'captcha_required_manual_review',
+                'captcha_still_present_after_submit'
+              );
             }
             if (solvedPostSubmit.status === 'solved') {
               // Some providers auto-submit from their CAPTCHA callback. If that
@@ -613,10 +698,25 @@ export async function POST(request: NextRequest) {
               await page.waitForTimeout(500);
               const afterSolveOutcome = await detectSubmissionOutcome(page, beforeUrl, beforeText, beforeFillState.filled);
               if (afterSolveOutcome.status === 'submitted') {
-                const result = storeResult({ status: 'submitted', contactUrl: page.url(), reason: afterSolveOutcome.reason, values: session.profile || {} });
+                const result = storeResult({
+                  status: 'submitted',
+                  contactUrl: page.url(),
+                  reason: afterSolveOutcome.reason,
+                  primaryReason: 'captcha_solved',
+                  failureDetail: afterSolveOutcome.reason,
+                  captchaDetected: true,
+                  captchaType: captchaState.captchaType,
+                  captchaProvider: captchaState.captchaType,
+                  values: session.profile || {},
+                });
                 return NextResponse.json({
                   success: true,
                   confirmed: true,
+                  captchaDetected: captchaState.captchaDetected,
+                  captchaClassificationLocked: captchaState.captchaClassificationLocked,
+                  captchaType: captchaState.captchaType,
+                  primaryReason: 'captcha_solved',
+                  failureDetail: afterSolveOutcome.reason,
                   confirmation: afterSolveOutcome.reason,
                   currentUrl: page.url(),
                   submitLabel: label,
@@ -627,14 +727,23 @@ export async function POST(request: NextRequest) {
                 });
               }
               if (afterSolveOutcome.status === 'captcha') {
-                return saveCaptcha(afterSolveOutcome.captchaProvider || 'CAPTCHA', afterSolveOutcome.reason);
+                return saveCaptcha(
+                  afterSolveOutcome.captchaProvider || 'CAPTCHA',
+                  afterSolveOutcome.reason,
+                  'captcha_required_manual_review',
+                  'captcha_present_after_post_submit_solve'
+                );
               }
               log('info', '✓ CAPTCHA solved; retrying final Submit/Send action with injected token');
               if (postSolveRetries >= MAX_POST_SOLVE_RETRIES) {
                 // Bounded retries exhausted — save for manual review rather than
                 // looping indefinitely.
                 log('warning', `Post-solve submit retry limit (${MAX_POST_SOLVE_RETRIES}) reached; saving for review`);
-                return saveReview(`Manual review required: post-CAPTCHA submit retried ${MAX_POST_SOLVE_RETRIES} time(s) without confirmation.`);
+                return saveReview(
+                  `Manual review required: post-CAPTCHA submit retried ${MAX_POST_SOLVE_RETRIES} time(s) without confirmation.`,
+                  'post_captcha_retry_limit_reached',
+                  captchaState.captchaType
+                );
               }
               postSolveRetries += 1;
               continue;
@@ -647,15 +756,34 @@ export async function POST(request: NextRequest) {
         // manual review instead of producing a false Success result.
         const outcome = await detectSubmissionOutcome(page, beforeUrl, beforeText, beforeFillState.filled);
         if (outcome.status === 'captcha') {
-          const result = storeResult({ status: 'captcha', contactUrl: page.url(), captchaProvider: outcome.captchaProvider || 'CAPTCHA', reason: outcome.reason, values: session.profile || {} });
-          return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: outcome.captchaProvider || 'CAPTCHA', error: outcome.reason, resultId: result?.id, steps }, { status: 409 });
+          return saveCaptcha(
+            outcome.captchaProvider || 'CAPTCHA',
+            outcome.reason,
+            'captcha_required_manual_review',
+            'captcha_detected_after_submit_action'
+          );
         }
         if (outcome.status === 'review') return saveReview(outcome.reason);
 
-        const result = storeResult({ status: 'submitted', contactUrl: page.url(), reason: outcome.reason, values: session.profile || {} });
+        const result = storeResult({
+          status: 'submitted',
+          contactUrl: page.url(),
+          reason: outcome.reason,
+          primaryReason: captchaState.captchaClassificationLocked ? 'captcha_solved' : 'submitted_success',
+          failureDetail: outcome.reason,
+          captchaDetected: captchaState.captchaDetected || undefined,
+          captchaType: captchaState.captchaType,
+          captchaProvider: captchaState.captchaType,
+          values: session.profile || {},
+        });
         return NextResponse.json({
           success: true,
           confirmed: true,
+          captchaDetected: captchaState.captchaDetected,
+          captchaClassificationLocked: captchaState.captchaClassificationLocked,
+          captchaType: captchaState.captchaType,
+          primaryReason: captchaState.captchaClassificationLocked ? 'captcha_solved' : 'submitted_success',
+          failureDetail: outcome.reason,
           confirmation: outcome.reason,
           currentUrl: page.url(),
           submitLabel: label,
@@ -673,8 +801,48 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, code: 'RUN_STOPPED', error: error.message }, { status: 409 });
     }
     try {
-      if (licenseId && target) addInquiryResult({ licenseId, runId: runId || 'unknown', sessionId, status: 'failed', target, contactUrl: target, reason: error instanceof Error ? error.message : String(error) });
+      if (licenseId && target) {
+        const primaryReason = mapCaptchaTerminalReason({
+          captchaDetected: captchaState.captchaDetected,
+          captchaClassificationLocked: captchaState.captchaClassificationLocked,
+          tokenReturned: captchaState.tokenReturned,
+          captchaStillPresent: true,
+          solverFailed: !captchaState.solveCompleted,
+          manualReview: true,
+        });
+        addInquiryResult({
+          licenseId,
+          runId: runId || 'unknown',
+          sessionId,
+          status: primaryReason ? 'captcha' : 'failed',
+          target,
+          contactUrl: target,
+          reason: error instanceof Error ? error.message : String(error),
+          primaryReason: primaryReason || 'submit_failed',
+          failureDetail: error instanceof Error ? error.message : String(error),
+          captchaDetected: primaryReason ? true : undefined,
+          captchaType: captchaState.captchaType,
+          captchaProvider: captchaState.captchaType,
+        });
+      }
     } catch {}
-    return NextResponse.json({ success: false, error: error instanceof Error ? error.message : String(error) }, { status: 400 });
+    const primaryReason = mapCaptchaTerminalReason({
+      captchaDetected: captchaState.captchaDetected,
+      captchaClassificationLocked: captchaState.captchaClassificationLocked,
+      tokenReturned: captchaState.tokenReturned,
+      captchaStillPresent: true,
+      solverFailed: !captchaState.solveCompleted,
+      manualReview: true,
+    });
+    return NextResponse.json({
+      success: false,
+      captchaDetected: !!primaryReason,
+      captchaClassificationLocked: !!primaryReason,
+      captchaType: primaryReason ? captchaState.captchaType : undefined,
+      captchaProvider: primaryReason ? captchaState.captchaType : undefined,
+      primaryReason: primaryReason || 'submit_failed',
+      failureDetail: error instanceof Error ? error.message : String(error),
+      error: error instanceof Error ? error.message : String(error),
+    }, { status: 400 });
   }
 }

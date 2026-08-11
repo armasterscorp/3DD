@@ -20,6 +20,7 @@ import {
   formatAttemptStep,
   getInquiryItemAttempt,
   isActiveInquiryItemAttempt,
+  markInquiryItemCaptchaDetected,
   registerInquiryItemTimer,
   renewInquiryItemOperation,
   startInquiryItemAttempt,
@@ -28,6 +29,7 @@ import {
   type InquiryTerminalReasonCode,
   type InquiryTerminalState,
 } from '@/lib/inquiry-item-lifecycle';
+import { isCaptchaPrimaryReason } from '@/lib/inquiry-submit-captcha-policy';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -145,25 +147,57 @@ async function withTargetWatchdog<T>(args: {
 }
 
 function terminalResultFor(
-  terminalState: InquiryTerminalState,
-  target: string,
-  detail?: string
-): { status: 'submitted' | 'failed' | 'captcha' | 'review'; reason?: string; captchaProvider?: string; contactUrl?: string } | null {
-  switch (terminalState) {
-    case 'SUBMITTED':
-      return { status: 'submitted', reason: detail || 'submitted_success' };
-    case 'SKIPPED_CAPTCHA_REQUIRED':
-      return { status: 'captcha', reason: detail || 'captcha_detected_autoskip', captchaProvider: 'CAPTCHA', contactUrl: target };
-    case 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED':
-      return { status: 'review', reason: detail || 'captcha_required_unsolved', contactUrl: target };
+  input: {
+    terminalState: InquiryTerminalState;
+    reasonCode: InquiryTerminalReasonCode;
+    target: string;
+    detail?: string;
+    captchaType?: string;
+  }
+): { status: 'submitted' | 'failed' | 'captcha' | 'review'; reason?: string; primaryReason?: string; failureDetail?: string; captchaDetected?: boolean; captchaType?: string; captchaProvider?: string; contactUrl?: string } | null {
+  if (input.terminalState === 'SUBMITTED') {
+    return {
+      status: 'submitted',
+      reason: input.detail || input.reasonCode,
+      primaryReason: input.reasonCode,
+      failureDetail: input.detail,
+      captchaDetected: input.reasonCode === 'captcha_solved' ? true : undefined,
+      captchaType: input.reasonCode === 'captcha_solved' ? input.captchaType : undefined,
+      captchaProvider: input.reasonCode === 'captcha_solved' ? input.captchaType || 'CAPTCHA' : undefined,
+      contactUrl: input.target,
+    };
+  }
+  if (isCaptchaPrimaryReason(input.reasonCode)) {
+    return {
+      status: 'captcha',
+      reason: input.detail || input.reasonCode,
+      primaryReason: input.reasonCode,
+      failureDetail: input.detail,
+      captchaDetected: true,
+      captchaType: input.captchaType,
+      captchaProvider: input.captchaType || 'CAPTCHA',
+      contactUrl: input.target,
+    };
+  }
+  switch (input.terminalState) {
     case 'TIMEOUT_SUBMIT':
-      return { status: 'review', reason: detail || 'submit_timeout', contactUrl: target };
+      return {
+        status: 'review',
+        reason: input.detail || 'submit_timeout',
+        primaryReason: input.reasonCode,
+        failureDetail: input.detail,
+        contactUrl: input.target,
+      };
     case 'SKIPPED_NO_FORM':
-      return { status: 'failed', reason: detail || 'no_form_found', contactUrl: target };
     case 'TIMEOUT_SCAN':
-      return { status: 'failed', reason: detail || 'scan_timeout', contactUrl: target };
     case 'FAILED':
-      return { status: 'failed', reason: detail || 'submit_failed', contactUrl: target };
+      return {
+        status: 'failed',
+        reason: input.detail || input.reasonCode,
+        primaryReason: input.reasonCode,
+        failureDetail: input.detail,
+        contactUrl: input.target,
+      };
     default:
       return null;
   }
@@ -184,8 +218,16 @@ function canonicalTerminalMessage(args: {
       return `${prefix} — [no_form_found] no usable contact/quote/inquiry form found; skipped automatically`;
     case 'captcha_detected_autoskip':
       return `${prefix} — [captcha_detected_autoskip] CAPTCHA still required on the active form; saved and skipped automatically`;
-    case 'captcha_required_unsolved':
-      return `${prefix} — [captcha_required_unsolved] CAPTCHA token was not accepted; manual review required`;
+    case 'captcha_solved':
+      return `${prefix} — [captcha_solved] CAPTCHA cleared and submission confirmed`;
+    case 'captcha_unsolved_after_token':
+      return `${prefix} — [captcha_unsolved_after_token] CAPTCHA token returned but the challenge is still required`;
+    case 'captcha_solver_timeout':
+      return `${prefix} — [captcha_solver_timeout] CAPTCHA solver timed out before the challenge cleared`;
+    case 'captcha_solver_failed':
+      return `${prefix} — [captcha_solver_failed] ${args.detail || 'CAPTCHA solve flow did not complete successfully'}`;
+    case 'captcha_required_manual_review':
+      return `${prefix} — [captcha_required_manual_review] ${args.detail || 'CAPTCHA path still needs manual review'}`;
     case 'scan_timeout':
       return `${prefix} — [scan_timeout] scan timed out; browser session recycled and skipped automatically`;
     case 'submit_timeout':
@@ -277,22 +319,30 @@ export function startInquiryBackendWorker(args: {
 
         const emitTerminal = (input: {
           terminalState: 'SUBMITTED';
-          reasonCode: 'submitted_success';
+          reasonCode: 'submitted_success' | 'captcha_solved';
           level: 'success';
           detail?: string;
           contactUrl?: string;
+          captchaType?: string;
         } | {
           terminalState: Exclude<InquiryTerminalState, 'SUBMITTED'>;
           reasonCode: Exclude<InquiryTerminalReasonCode, 'submitted_success'>;
           level: 'success' | 'warning' | 'error';
           detail?: string;
           contactUrl?: string;
+          captchaType?: string;
         }): boolean => {
           const emitted = input.terminalState === 'SUBMITTED'
             ? finishInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail)
             : cancelInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail);
           if (!emitted) return false;
-          const result = terminalResultFor(input.terminalState, input.contactUrl || target, input.detail);
+          const result = terminalResultFor({
+            terminalState: input.terminalState,
+            reasonCode: input.reasonCode,
+            target: input.contactUrl || target,
+            detail: input.detail,
+            captchaType: input.captchaType,
+          });
           if (result) {
             addInquiryResult({
               licenseId: args.licenseId,
@@ -375,7 +425,13 @@ export function startInquiryBackendWorker(args: {
             sessionGeneration += 1;
             continue;
           }
-          cancelInquiryItemAttempt(attempt, 'FAILED', 'submit_failed', 'prepare_exception');
+          const snapshot = getInquiryItemAttempt(attempt);
+          cancelInquiryItemAttempt(
+            attempt,
+            snapshot?.captchaClassificationLocked ? 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED' : 'FAILED',
+            snapshot?.captchaClassificationLocked ? 'captcha_solver_failed' : 'submit_failed',
+            'prepare_exception'
+          );
           throw error;
         }
         assertWorkerActive(args.licenseId, args.runId);
@@ -402,25 +458,30 @@ export function startInquiryBackendWorker(args: {
         }
 
         const classification = String(prepared.classification || (prepared.captchaDetected ? 'captcha' : 'form_found'));
+        if (prepared?.captchaDetected || prepared?.captchaClassificationLocked) {
+          markInquiryItemCaptchaDetected(attempt, prepared?.captchaType || prepared?.captchaProvider);
+        }
         if (classification === 'captcha') {
           transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
           transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
           emitTerminal({
             terminalState: 'SKIPPED_CAPTCHA_REQUIRED',
-            reasonCode: 'captcha_detected_autoskip',
+            reasonCode: isCaptchaPrimaryReason(prepared?.primaryReason) ? prepared.primaryReason : 'captcha_detected_autoskip',
             level: 'warning',
-            detail: `${prepared.captchaProvider || 'CAPTCHA'} required on ${prepared.contactUrl || target}`,
+            detail: prepared.failureDetail || prepared.reason || `${prepared.captchaProvider || 'CAPTCHA'} required on ${prepared.contactUrl || target}`,
             contactUrl: prepared.contactUrl || target,
+            captchaType: prepared?.captchaType || prepared?.captchaProvider,
           });
         } else if (classification === 'review_required') {
           transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
           transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
           emitTerminal({
             terminalState: 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED',
-            reasonCode: 'captcha_required_unsolved',
+            reasonCode: isCaptchaPrimaryReason(prepared?.primaryReason) ? prepared.primaryReason : 'captcha_required_manual_review',
             level: 'warning',
-            detail: prepared.reviewReason || 'manual interaction needed',
+            detail: prepared.failureDetail || prepared.reviewReason || prepared.reason || 'manual interaction needed',
             contactUrl: prepared.contactUrl || target,
+            captchaType: prepared?.captchaType || prepared?.captchaProvider,
           });
         } else if (classification === 'site_unavailable') {
           emitTerminal({
@@ -482,7 +543,13 @@ export function startInquiryBackendWorker(args: {
               sessionGeneration += 1;
               continue;
             }
-            cancelInquiryItemAttempt(attempt, 'FAILED', 'submit_failed', 'submit_exception');
+            const snapshot = getInquiryItemAttempt(attempt);
+            cancelInquiryItemAttempt(
+              attempt,
+              snapshot?.captchaClassificationLocked ? 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED' : 'FAILED',
+              snapshot?.captchaClassificationLocked ? 'captcha_solver_failed' : 'submit_failed',
+              'submit_exception'
+            );
             throw error;
           }
           assertWorkerActive(args.licenseId, args.runId);
@@ -493,32 +560,40 @@ export function startInquiryBackendWorker(args: {
           if (!isActiveInquiryItemAttempt(attempt)) continue;
 
           if (submitResponse.ok && submitted?.success) {
+            const snapshot = getInquiryItemAttempt(attempt);
             emitTerminal({
               terminalState: 'SUBMITTED',
-              reasonCode: 'submitted_success',
+              reasonCode: snapshot?.captchaClassificationLocked ? 'captcha_solved' : 'submitted_success',
               level: 'success',
               detail: submitted.confirmation || submitted.currentUrl || prepared.contactUrl || target,
               contactUrl: submitted.currentUrl || prepared.contactUrl || target,
+              captchaType: snapshot?.captchaType,
             });
           } else if (submitted?.captchaDetected) {
+            markInquiryItemCaptchaDetected(attempt, submitted?.captchaType || submitted?.captchaProvider);
             transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
             transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
             emitTerminal({
               terminalState: 'SKIPPED_CAPTCHA_REQUIRED',
-              reasonCode: 'captcha_detected_autoskip',
+              reasonCode: isCaptchaPrimaryReason(submitted?.primaryReason) ? submitted.primaryReason : 'captcha_detected_autoskip',
               level: 'warning',
-              detail: `${submitted.captchaProvider || 'CAPTCHA'} required during submit`,
+              detail: submitted.failureDetail || submitted.error || submitted.reason || `${submitted.captchaProvider || 'CAPTCHA'} required during submit`,
               contactUrl: prepared.contactUrl || target,
+              captchaType: submitted?.captchaType || submitted?.captchaProvider,
             });
           } else if (submitted?.reviewRequired) {
+            if (submitted?.captchaClassificationLocked || isCaptchaPrimaryReason(submitted?.primaryReason)) {
+              markInquiryItemCaptchaDetected(attempt, submitted?.captchaType || submitted?.captchaProvider);
+            }
             transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
             transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
             emitTerminal({
               terminalState: 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED',
-              reasonCode: 'captcha_required_unsolved',
+              reasonCode: isCaptchaPrimaryReason(submitted?.primaryReason) ? submitted.primaryReason : 'captcha_required_manual_review',
               level: 'warning',
-              detail: submitted.reason || submitted.error || 'manual interaction needed',
+              detail: submitted.failureDetail || submitted.reason || submitted.error || 'manual interaction needed',
               contactUrl: prepared.contactUrl || target,
+              captchaType: submitted?.captchaType || submitted?.captchaProvider,
             });
           } else {
             if (submitted?.code === 'RUN_STOPPED') {
@@ -527,12 +602,15 @@ export function startInquiryBackendWorker(args: {
                 getInquiryRunDiagnostics(args.licenseId, args.runId)
               );
             }
+            const snapshot = getInquiryItemAttempt(attempt);
+            const captchaLocked = !!snapshot?.captchaClassificationLocked;
             emitTerminal({
-              terminalState: 'FAILED',
-              reasonCode: 'submit_failed',
-              level: 'error',
-              detail: submitted?.error || `HTTP ${submitResponse.status}`,
+              terminalState: captchaLocked ? 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED' : 'FAILED',
+              reasonCode: captchaLocked ? 'captcha_solver_failed' : 'submit_failed',
+              level: captchaLocked ? 'warning' : 'error',
+              detail: submitted?.failureDetail || submitted?.error || `HTTP ${submitResponse.status}`,
               contactUrl: prepared.contactUrl || target,
+              captchaType: snapshot?.captchaType,
             });
           }
         }
