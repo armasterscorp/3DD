@@ -331,16 +331,6 @@ export function emitInquiryItemTerminal(
         `[debug] invalid terminal transition ignored item=${current.index + 1} attempt=${current.attemptId} from=${current.state} to=${terminalState}`
       );
     }
-
-    export function markInquiryItemCaptchaDetected(ref: InquiryAttemptRef, captchaType?: string): boolean {
-      const current = currentFor(ref);
-      if (!current) return false;
-      current.captchaDetected = true;
-      current.captchaClassificationLocked = true;
-      if (captchaType) current.captchaType = captchaType;
-      current.updatedAt = new Date().toISOString();
-      return true;
-    }
     return false;
   }
   current.state = terminalState;
@@ -352,6 +342,16 @@ export function emitInquiryItemTerminal(
   current.updatedAt = current.cancelledAt;
   clearTimers(current);
   abortAllControllers(current, reason || reasonCode);
+  return true;
+}
+
+export function markInquiryItemCaptchaDetected(ref: InquiryAttemptRef, captchaType?: string): boolean {
+  const current = currentFor(ref);
+  if (!current) return false;
+  current.captchaDetected = true;
+  current.captchaClassificationLocked = true;
+  if (captchaType) current.captchaType = captchaType;
+  current.updatedAt = new Date().toISOString();
   return true;
 }
 

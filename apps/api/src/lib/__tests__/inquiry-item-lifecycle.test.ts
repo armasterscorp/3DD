@@ -137,12 +137,12 @@ describe('inquiry item lifecycle', () => {
     transitionInquiryItemState(attempt, 'FORM_FOUND');
     transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
     transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
-    cancelInquiryItemAttempt(attempt, 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED', 'captcha_required_unsolved', 'captcha remained');
+    cancelInquiryItemAttempt(attempt, 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED', 'captcha_required_manual_review', 'captcha remained');
     finishInquiryItemAttempt(attempt, 'SUBMITTED', 'submitted_success', 'should not happen');
 
     const snapshot = getInquiryItemAttempt(attempt);
     expect(snapshot?.terminalState).toBe('REVIEW_REQUIRED_CAPTCHA_UNSOLVED');
-    expect(snapshot?.terminalReasonCode).toBe('captcha_required_unsolved');
+    expect(snapshot?.terminalReasonCode).toBe('captcha_required_manual_review');
     expect(snapshot?.terminalEmitted).toBe(true);
   });
 });
