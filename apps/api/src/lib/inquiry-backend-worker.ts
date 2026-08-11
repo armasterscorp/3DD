@@ -145,7 +145,9 @@ function terminalResultFor(
     case 'TIMEOUT_SUBMIT':
       return { status: 'review', reason: detail || 'submit_timeout', contactUrl: target };
     case 'SKIPPED_NO_FORM':
+      return { status: 'failed', reason: detail || 'no_form_found', contactUrl: target };
     case 'TIMEOUT_SCAN':
+      return { status: 'failed', reason: detail || 'scan_timeout', contactUrl: target };
     case 'FAILED':
       return { status: 'failed', reason: detail || 'submit_failed', contactUrl: target };
     default:
