@@ -1,5 +1,11 @@
-import { TwoCaptchaSolver, getUserApiKey } from './captcha-solver';
+import { TwoCaptchaSolver, getUserApiKey, CaptchaSolveOptions } from './captcha-solver';
 import { CaptchaStore } from './captcha-store';
+import {
+  buildCaptchaJobKey,
+  cancelCaptchaJob,
+  getOrCreateCaptchaJob,
+} from './captcha-job-registry';
+import { type InquiryAttemptRef, isActiveInquiryItemAttempt } from './inquiry-item-lifecycle';
 
 /**
  * Detected CAPTCHA descriptor returned by the private detectors.
@@ -21,6 +27,18 @@ interface DetectedCaptcha {
   minScore?: number;
   pageAction?: string;
   isEnterprise: boolean;
+}
+
+/**
+ * Context for a captcha solve attempt bound to a specific item attempt.
+ * When provided, the handler enforces:
+ *  - One active solve job per jobKey (dedup via CaptchaJobRegistry)
+ *  - AbortSignal wired to the item lifecycle captcha controller
+ *  - Injection guard: tokens are discarded if the attempt is no longer active
+ */
+export interface CaptchaHandlerContext {
+  attemptRef?: InquiryAttemptRef;
+  signal?: AbortSignal;
 }
 
 /**
@@ -51,14 +69,16 @@ export class InquiryCaptchaHandler {
    * Detect and solve CAPTCHA on the page.
    *
    * Status values:
-   *   solved           – token injected, page accepted it
-   *   not_found        – no CAPTCHA widget detected on the page
-   *   solver_unavailable – solver is not configured (no API key)
-   *   failed           – solver is configured but the solve attempt failed
+   *   solved              – token injected, page accepted it
+   *   not_found           – no CAPTCHA widget detected on the page
+   *   solver_unavailable  – solver is not configured (no API key)
+   *   failed              – solver is configured but the solve attempt failed
+   *   stale_ignored       – provider returned a token after the attempt was
+   *                         already terminal; token was NOT injected
    */
-  async handleCaptcha(page: any): Promise<{
+  async handleCaptcha(page: any, ctx?: CaptchaHandlerContext): Promise<{
     handled: boolean;
-    status: 'solved' | 'failed' | 'not_found' | 'solver_unavailable';
+    status: 'solved' | 'failed' | 'not_found' | 'solver_unavailable' | 'stale_ignored';
     providerType?: CaptchaProviderType;
     solution?: string;
     error?: string;
@@ -80,13 +100,13 @@ export class InquiryCaptchaHandler {
       const turnstile = await this.detectTurnstile(page);
       if (turnstile) {
         console.log(`[Inquiry CAPTCHA] Detected ${turnstile.provider}`);
-        return await this.solveDetected(turnstile, pageUrl);
+        return await this.solveDetected(turnstile, pageUrl, ctx);
       }
 
       const hcaptcha = await this.detectHcaptcha(page);
       if (hcaptcha) {
         console.log('[Inquiry CAPTCHA] Detected hCaptcha');
-        return await this.solveDetected(hcaptcha, pageUrl);
+        return await this.solveDetected(hcaptcha, pageUrl, ctx);
       }
 
       // reCAPTCHA enterprise scripts must be tested before standard ones
@@ -94,25 +114,25 @@ export class InquiryCaptchaHandler {
       const recaptchaV3Enterprise = await this.detectRecaptchaV3Enterprise(page);
       if (recaptchaV3Enterprise) {
         console.log('[Inquiry CAPTCHA] Detected reCAPTCHA v3 Enterprise');
-        return await this.solveDetected(recaptchaV3Enterprise, pageUrl);
+        return await this.solveDetected(recaptchaV3Enterprise, pageUrl, ctx);
       }
 
       const recaptchaV3 = await this.detectRecaptchaV3(page);
       if (recaptchaV3) {
         console.log('[Inquiry CAPTCHA] Detected reCAPTCHA v3');
-        return await this.solveDetected(recaptchaV3, pageUrl);
+        return await this.solveDetected(recaptchaV3, pageUrl, ctx);
       }
 
       const recaptchaV2Enterprise = await this.detectRecaptchaV2Enterprise(page);
       if (recaptchaV2Enterprise) {
         console.log('[Inquiry CAPTCHA] Detected reCAPTCHA v2 Enterprise');
-        return await this.solveDetected(recaptchaV2Enterprise, pageUrl);
+        return await this.solveDetected(recaptchaV2Enterprise, pageUrl, ctx);
       }
 
       const recaptchaV2 = await this.detectRecaptchaV2(page);
       if (recaptchaV2) {
         console.log('[Inquiry CAPTCHA] Detected reCAPTCHA v2');
-        return await this.solveDetected(recaptchaV2, pageUrl);
+        return await this.solveDetected(recaptchaV2, pageUrl, ctx);
       }
 
       console.log('[Inquiry CAPTCHA] No CAPTCHA widget detected');
@@ -403,10 +423,11 @@ export class InquiryCaptchaHandler {
 
   private async solveDetected(
     captcha: DetectedCaptcha,
-    pageUrl: string
+    pageUrl: string,
+    ctx?: CaptchaHandlerContext
   ): Promise<{
     handled: boolean;
-    status: 'solved' | 'failed';
+    status: 'solved' | 'failed' | 'stale_ignored';
     providerType: CaptchaProviderType;
     solution?: string;
     error?: string;
@@ -415,48 +436,64 @@ export class InquiryCaptchaHandler {
       return { handled: false, status: 'failed', providerType: captcha.provider, error: 'Solver not configured' };
     }
 
+    const attemptRef = ctx?.attemptRef;
+    const solveOptions: CaptchaSolveOptions = {
+      signal: ctx?.signal,
+      logContext: attemptRef
+        ? {
+            runId: attemptRef.runId,
+            itemId: String(attemptRef.index),
+            attemptId: attemptRef.attemptId,
+          }
+        : undefined,
+    };
+
+    // Build a deterministic job key when we have full attempt context.
+    const jobKey = attemptRef
+      ? buildCaptchaJobKey(attemptRef.runId, attemptRef.index, attemptRef.attemptId, captcha.provider)
+      : undefined;
+
     try {
       let token: string;
 
-      switch (captcha.provider) {
-        case 'recaptcha_v2':
-        case 'recaptcha_v2_enterprise':
-          if (!captcha.siteKey) throw new Error(`Missing sitekey for ${captcha.provider}`);
-          token = await this.solver.solveRecaptchaV2(pageUrl, captcha.siteKey, captcha.isEnterprise);
-          await this.injectRecaptchaV2Token(token);
-          break;
+      if (jobKey) {
+        // ── Dedup: return the existing active job promise if one is running ──
+        const { promise, isNew } = getOrCreateCaptchaJob(
+          jobKey,
+          {
+            ownerRunId: attemptRef!.runId,
+            ownerItemId: String(attemptRef!.index),
+            ownerAttemptId: attemptRef!.attemptId,
+            captchaType: captcha.provider,
+          },
+          (abortSignal, onCaptchaId, onPollTick) => {
+            const opts: CaptchaSolveOptions = { ...solveOptions, signal: abortSignal, onCaptchaId, onPollTick };
+            return this.dispatchSolve(captcha, pageUrl, opts);
+          }
+        );
 
-        case 'recaptcha_v3':
-        case 'recaptcha_v3_enterprise':
-          if (!captcha.siteKey) throw new Error(`Missing sitekey for ${captcha.provider}`);
-          token = await this.solver.solveRecaptchaV3(
-            pageUrl,
-            captcha.siteKey,
-            captcha.minScore ?? 0.9,
-            captcha.pageAction,
-            captcha.isEnterprise
-          );
-          await this.injectRecaptchaV3Token(token);
-          break;
-
-        case 'turnstile_standalone':
-        case 'turnstile_challenge':
-          if (!captcha.siteKey) throw new Error(`Missing sitekey for ${captcha.provider}`);
-          token = await this.solver.solveTurnstile(pageUrl, captcha.siteKey);
-          await this.injectTurnstileToken(token);
-          break;
-
-        case 'hcaptcha':
-          if (!captcha.siteKey) throw new Error('Missing sitekey for hCaptcha');
-          token = await this.solver.solveHcaptcha(pageUrl, captcha.siteKey);
-          await this.injectHcaptchaToken(token);
-          break;
-
-        default: {
-          const _exhaustive: never = captcha.provider;
-          throw new Error(`Unsupported CAPTCHA provider: ${_exhaustive}`);
+        if (!isNew) {
+          console.log(`[Inquiry CAPTCHA] Reusing active job for jobKey=${jobKey}`);
         }
+
+        token = await promise;
+      } else {
+        // No attemptRef — call solver directly without registry.
+        token = await this.dispatchSolve(captcha, pageUrl, solveOptions);
       }
+
+      // ── Injection guard: discard token if item attempt is no longer active ──
+      if (attemptRef && !isActiveInquiryItemAttempt(attemptRef)) {
+        console.debug(
+          `[Inquiry CAPTCHA] stale_provider_solution_ignored ` +
+          `jobKey=${jobKey ?? 'n/a'} provider=${captcha.provider} ` +
+          `attemptId=${attemptRef.attemptId} — attempt already terminal`
+        );
+        return { handled: false, status: 'stale_ignored', providerType: captcha.provider, solution: undefined };
+      }
+
+      // Inject token into the page.
+      await this.injectToken(captcha.provider, token);
 
       await CaptchaStore.queueCaptcha({
         userId: this.userId,
@@ -471,8 +508,61 @@ export class InquiryCaptchaHandler {
       console.log(`[Inquiry CAPTCHA] ${captcha.provider} solved and injected`);
       return { handled: true, status: 'solved', providerType: captcha.provider, solution: token };
     } catch (error: any) {
+      // Cancel the registry job on error so the next attempt starts fresh.
+      if (jobKey) cancelCaptchaJob(jobKey, error?.code ?? error?.message ?? 'solve_error');
       console.error(`[Inquiry CAPTCHA] ${captcha.provider} solving failed:`, error.message);
       return { handled: false, status: 'failed', providerType: captcha.provider, error: error.message };
+    }
+  }
+
+  /** Dispatch to the correct solver method based on provider. */
+  private dispatchSolve(captcha: DetectedCaptcha, pageUrl: string, opts: CaptchaSolveOptions): Promise<string> {
+    if (!this.solver) throw new Error('Solver not configured');
+    switch (captcha.provider) {
+      case 'recaptcha_v2':
+      case 'recaptcha_v2_enterprise':
+        if (!captcha.siteKey) throw new Error(`Missing sitekey for ${captcha.provider}`);
+        return this.solver.solveRecaptchaV2(pageUrl, captcha.siteKey, captcha.isEnterprise, opts);
+
+      case 'recaptcha_v3':
+      case 'recaptcha_v3_enterprise':
+        if (!captcha.siteKey) throw new Error(`Missing sitekey for ${captcha.provider}`);
+        return this.solver.solveRecaptchaV3(pageUrl, captcha.siteKey, captcha.minScore ?? 0.9, captcha.pageAction, captcha.isEnterprise, opts);
+
+      case 'turnstile_standalone':
+      case 'turnstile_challenge':
+        if (!captcha.siteKey) throw new Error(`Missing sitekey for ${captcha.provider}`);
+        return this.solver.solveTurnstile(pageUrl, captcha.siteKey, opts);
+
+      case 'hcaptcha':
+        if (!captcha.siteKey) throw new Error('Missing sitekey for hCaptcha');
+        return this.solver.solveHcaptcha(pageUrl, captcha.siteKey, opts);
+
+      default: {
+        const _exhaustive: never = captcha.provider;
+        throw new Error(`Unsupported CAPTCHA provider: ${_exhaustive}`);
+      }
+    }
+  }
+
+  /** Inject a solved token into the page for the given provider. */
+  private async injectToken(provider: CaptchaProviderType, token: string): Promise<void> {
+    switch (provider) {
+      case 'recaptcha_v2':
+      case 'recaptcha_v2_enterprise':
+        await this.injectRecaptchaV2Token(token);
+        break;
+      case 'recaptcha_v3':
+      case 'recaptcha_v3_enterprise':
+        await this.injectRecaptchaV3Token(token);
+        break;
+      case 'turnstile_standalone':
+      case 'turnstile_challenge':
+        await this.injectTurnstileToken(token);
+        break;
+      case 'hcaptcha':
+        await this.injectHcaptchaToken(token);
+        break;
     }
   }
 

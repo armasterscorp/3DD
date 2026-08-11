@@ -530,7 +530,7 @@ export async function POST(request: NextRequest) {
       log('info', message);
       try {
         const result = await Promise.race([
-          captchaHandler.handleCaptcha(page),
+          captchaHandler.handleCaptcha(page, { attemptRef: attemptRef ?? undefined, signal: captchaSignal ?? undefined }),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
             setTimeout(() => resolve({ handled: false, status: 'failed', error: 'captcha_timeout_after_75_seconds' }), INQUIRY_CAPTCHA_TIMEOUT_MS)
           ),
