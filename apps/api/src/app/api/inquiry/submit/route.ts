@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-store';
-import { addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
+import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
+import { CaptchaStore } from '@/lib/captcha-store';
+import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -253,6 +255,20 @@ async function handleBlockingOverlays(page: any): Promise<{ reviewRequired?: str
 }
 
 async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean; provider?: string }> {
+  // If a provider response token is already populated, treat that provider as
+  // satisfied. Checkbox widgets often remain visible after completion.
+  const solvedState = await page.evaluate(() => {
+    const valueOf = (selector: string) => {
+      const el = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
+      return String(el?.value || '').trim();
+    };
+    return {
+      recaptcha: valueOf('textarea[name="g-recaptcha-response"], input[name="g-recaptcha-response"], #g-recaptcha-response'),
+      hcaptcha: valueOf('textarea[name="h-captcha-response"], input[name="h-captcha-response"]'),
+      turnstile: valueOf('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'),
+    };
+  }).catch(() => ({ recaptcha: '', hcaptcha: '', turnstile: '' }));
+
   const formText = String(await form.innerText().catch(() => ''))
     .replace(/protected by\s+recaptcha/ig, '')
     .replace(/recaptcha privacy terms/ig, '')
@@ -265,15 +281,18 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     .replace(/protected by\s+cloudflare/ig, '');
 
   const challengeText = `${formText}\n${bodyText}`;
-  if (/verify (?:that )?you are human|i am not a robot|security check|human verification|prove (?:that )?you are human|complete (?:the )?(?:security|human) check|press and hold|complete (?:the )?captcha|captcha (?:is )?required|captcha validation failed|please (?:complete|solve|verify).*captcha|please check .*captcha|verification required/i.test(challengeText)) {
-    return {
-      detected: true,
-      provider:
-        /hcaptcha/i.test(challengeText) ? 'hCaptcha' :
-        /cloudflare|turnstile/i.test(challengeText) ? 'Cloudflare Turnstile' :
-        /recaptcha/i.test(challengeText) ? 'reCAPTCHA' :
-        'CAPTCHA / human verification',
-    };
+  const challengePattern = /verify (?:that )?you are human|i am not a robot|security check|human verification|prove (?:that )?you are human|complete (?:the )?(?:security|human) check|press and hold|complete (?:the )?captcha|captcha (?:is )?required|captcha validation failed|captcha verification failed|invalid captcha|incorrect captcha|captcha not verified|please (?:complete|solve|verify|check|confirm).*captcha|please check .*captcha|verification required|robot verification|anti[- ]?spam verification/i;
+  if (challengePattern.test(challengeText)) {
+    const provider =
+      /hcaptcha/i.test(challengeText) ? 'hCaptcha' :
+      /cloudflare|turnstile/i.test(challengeText) ? 'Cloudflare Turnstile' :
+      /recaptcha/i.test(challengeText) ? 'reCAPTCHA' :
+      'CAPTCHA / human verification';
+    const alreadySolved =
+      (provider === 'hCaptcha' && !!solvedState.hcaptcha) ||
+      (provider === 'Cloudflare Turnstile' && !!solvedState.turnstile) ||
+      (provider === 'reCAPTCHA' && !!solvedState.recaptcha);
+    if (!alreadySolved) return { detected: true, provider };
   }
 
   // Visible checkbox-style provider widget counts as a blocking CAPTCHA.
@@ -290,13 +309,17 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     const titleAttr = String(await frame.getAttribute('title').catch(() => '') || '');
 
     if (box.width >= 160 && box.height >= 45) {
-      return {
-        detected: true,
-        provider:
-          /hcaptcha/i.test(`${src} ${titleAttr}`) ? 'hCaptcha' :
-          /cloudflare|turnstile/i.test(`${src} ${titleAttr}`) ? 'Cloudflare Turnstile' :
-          'reCAPTCHA',
-      };
+      const marker = `${src} ${titleAttr}`;
+      const provider =
+        /hcaptcha/i.test(marker) ? 'hCaptcha' :
+        /cloudflare|turnstile/i.test(marker) ? 'Cloudflare Turnstile' :
+        /recaptcha|google\.com\/recaptcha/i.test(marker) ? 'reCAPTCHA' :
+        'CAPTCHA / human verification';
+      const alreadySolved =
+        (provider === 'hCaptcha' && !!solvedState.hcaptcha) ||
+        (provider === 'Cloudflare Turnstile' && !!solvedState.turnstile) ||
+        (provider === 'reCAPTCHA' && !!solvedState.recaptcha);
+      if (!alreadySolved) return { detected: true, provider };
     }
   }
 
@@ -312,7 +335,7 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     if (!(await node.isVisible().catch(() => false))) continue;
     const msg = String(await node.innerText().catch(() => '') || '').trim();
     if (!msg) continue;
-    if (/captcha|recaptcha|hcaptcha|turnstile|human verification|verify (?:that )?you are human|verification required|security check/i.test(msg)) {
+    if (/captcha|recaptcha|hcaptcha|turnstile|human verification|verify (?:that )?you are human|verification required|security check|robot verification|anti[- ]?spam verification/i.test(msg)) {
       return {
         detected: true,
         provider:
@@ -350,6 +373,54 @@ export async function POST(request: NextRequest) {
       const result = addInquiryResult({ licenseId, runId, sessionId, status: 'review', target, contactUrl: page.url(), reason, values: session.profile || {} });
       return NextResponse.json({ success: false, reviewRequired: true, reason, resultId: result.id, steps }, { status: 409 });
     };
+    const saveCaptcha = (provider: string, reason: string) => {
+      const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: provider || 'CAPTCHA', reason, values: session.profile || {} });
+      return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: provider || 'CAPTCHA', error: reason, resultId: result.id, steps }, { status: 409 });
+    };
+    const captchaConfig = await CaptchaStore.getCaptchaConfig(licenseId);
+    const savedApiKey = captchaConfig?.isActive ? captchaConfig.apiKey : '';
+    const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    const solveCaptchaWithTimeout = async (message: string) => {
+      if (!captchaHandler) return { status: 'unconfigured' as const };
+      addInquiryLog({ licenseId, runId, level: 'info', message });
+      try {
+        const result = await Promise.race([
+          captchaHandler.handleCaptcha(page),
+          new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
+            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 75 seconds' }), 75_000)
+          ),
+        ]);
+        if (result.status === 'solved') {
+          // Do not report success just because a token was returned. The page
+          // itself must stop presenting a CAPTCHA requirement first.
+          await page.waitForTimeout(450).catch(() => undefined);
+          const stillRequired = await detectCaptcha(page, page.locator('body'));
+          if (stillRequired.detected) {
+            addInquiryLog({
+              licenseId,
+              runId,
+              level: 'warning',
+              message: `CAPTCHA solution returned, but ${stillRequired.provider || 'CAPTCHA'} is still required on ${String(page.url?.() || '')}`,
+            });
+          } else {
+            addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA cleared on ${String(page.url?.() || '')}` });
+          }
+        } else if (result.status === 'not_found') {
+          addInquiryLog({ licenseId, runId, level: 'info', message: 'no CAPTCHA detected' });
+        } else if (result.status === 'failed') {
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+        }
+        return result;
+      } catch (error) {
+        addInquiryLog({
+          licenseId,
+          runId,
+          level: 'warning',
+          message: `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`,
+        });
+        return { handled: false, status: 'failed' as const };
+      }
+    };
 
     // Some inquiry forms use Next/Continue -> Review -> Submit. Walk those
     // visible form actions automatically, but stop on CAPTCHA or if the form
@@ -369,13 +440,18 @@ export async function POST(request: NextRequest) {
       const overlayState = await handleBlockingOverlays(page);
       if (overlayState.reviewRequired) return saveReview(overlayState.reviewRequired);
 
+      await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission');
       const captcha = await detectCaptcha(page, chosen);
       if (captcha.detected) {
-        addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: captcha.provider || 'CAPTCHA', reason: 'CAPTCHA detected during submit/review', values: session.profile || {} });
-        return NextResponse.json(
-          { success: false, captchaDetected: true, captchaProvider: captcha.provider || 'CAPTCHA', error: `CAPTCHA detected (${captcha.provider || 'CAPTCHA'}). This form was not submitted.` },
-          { status: 409 }
-        );
+        const provider = captcha.provider || 'CAPTCHA';
+        const reason = `CAPTCHA detected before the submit action (${provider}).`;
+        addInquiryLog({
+          licenseId,
+          runId,
+          level: 'warning',
+          message: `⚠ ${reason} Saved as CAPTCHA and skipped; Submit was not clicked.`,
+        });
+        return saveCaptcha(provider, reason);
       }
 
       const submit = await findSubmitControl(chosen);
@@ -423,6 +499,46 @@ export async function POST(request: NextRequest) {
 
       const isIntermediate = /\b(next|continue|review|preview|suivant|continuer|poursuivre|reviser|aperçu|apercu)\b/i.test(label) && !/\b(send|submit|finish|complete|request|apply|envoyer|soumettre|terminer|finaliser)\b/i.test(label);
       if (!isIntermediate) {
+        await page.waitForTimeout(1200);
+        if (captchaHandler) {
+          const postSubmitCaptcha = await captchaHandler.checkPostSubmitCaptcha(page);
+          if (postSubmitCaptcha.detected) {
+            const solvedPostSubmit = await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve');
+            const unresolvedPostSubmit = await detectCaptcha(page, page.locator('body'));
+            if (unresolvedPostSubmit.detected) {
+              return saveCaptcha(
+                unresolvedPostSubmit.provider || postSubmitCaptcha.type || 'CAPTCHA',
+                `CAPTCHA remained unresolved after the submit action (${unresolvedPostSubmit.provider || postSubmitCaptcha.type || 'CAPTCHA'}).`
+              );
+            }
+            if (solvedPostSubmit.status === 'solved') {
+              // Some providers auto-submit from their CAPTCHA callback. If that
+              // happened, record success now. Otherwise retry the final form
+              // action on the next loop with the injected token still present.
+              await page.waitForTimeout(500);
+              const afterSolveOutcome = await detectSubmissionOutcome(page, beforeUrl, beforeText, beforeFillState.filled);
+              if (afterSolveOutcome.status === 'submitted') {
+                const result = addInquiryResult({ licenseId, runId, sessionId, status: 'submitted', target, contactUrl: page.url(), reason: afterSolveOutcome.reason, values: session.profile || {} });
+                return NextResponse.json({
+                  success: true,
+                  confirmed: true,
+                  confirmation: afterSolveOutcome.reason,
+                  currentUrl: page.url(),
+                  submitLabel: label,
+                  steps,
+                  submittedValues: session.profile || {},
+                  resultId: result.id,
+                  message: `Form submission confirmed after CAPTCHA solving: ${steps.join(' -> ')}`,
+                });
+              }
+              if (afterSolveOutcome.status === 'captcha') {
+                return saveCaptcha(afterSolveOutcome.captchaProvider || 'CAPTCHA', afterSolveOutcome.reason);
+              }
+              addInquiryLog({ licenseId, runId, level: 'info', message: '✓ CAPTCHA solved; retrying final Submit/Send action with injected token' });
+              continue;
+            }
+          }
+        }
         // A button label alone is not proof that the form was submitted. Wait
         // for an explicit success/confirmation state. If the site reveals
         // another section or gives no reliable confirmation, keep it for
