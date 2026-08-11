@@ -35,6 +35,7 @@ export type InquiryTerminalReasonCode =
   | 'scan_timeout'
   | 'submit_timeout'
   | 'submit_failed'
+  | 'run_context_invalid'
   | 'submitted_success';
 
 export type InquiryOperationKind = 'scan' | 'captcha' | 'submit';

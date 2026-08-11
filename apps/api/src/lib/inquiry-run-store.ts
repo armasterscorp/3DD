@@ -96,17 +96,28 @@ export function getInquiryRunState(licenseIdValue: string): RunState {
 }
 
 export class InquiryRunStoppedError extends Error {
-  constructor() {
-    super('Inquiry run stopped by user.');
+  public readonly code: 'stopped_by_user' | 'stale_run_context';
+  constructor(code: 'stopped_by_user' | 'stale_run_context' = 'stopped_by_user') {
+    super(code === 'stopped_by_user' ? 'Inquiry run stopped by user.' : 'Inquiry run context is no longer active.');
     this.name = 'InquiryRunStoppedError';
+    this.code = code;
   }
 }
 
-export async function inquiryCheckpoint(licenseIdValue: string): Promise<void> {
+/**
+ * Checkpoint for long-running inquiry operations. Throws if the run has been
+ * stopped or if a different run has become active for this license (stale-run
+ * detection). Pass `expectedRunId` to enable run-scoped cancellation isolation;
+ * without it only the global stopped flag is checked.
+ */
+export async function inquiryCheckpoint(licenseIdValue: string, expectedRunId?: string): Promise<void> {
   const licenseId = safeLicenseId(licenseIdValue);
   for (;;) {
     const state = getInquiryRunState(licenseId);
-    if (state.mode === 'stopped') throw new InquiryRunStoppedError();
+    if (state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
+    if (expectedRunId && state.runId && state.runId !== expectedRunId) {
+      throw new InquiryRunStoppedError('stale_run_context');
+    }
     if (state.mode !== 'paused') return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }

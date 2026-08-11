@@ -28,9 +28,14 @@ import {
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
+  __threeDSuiteInquiryActiveRunIds?: Map<string, string>;
 };
 const workers = globalWorkers.__threeDSuiteInquiryWorkers ?? new Map<string, Promise<void>>();
 if (!globalWorkers.__threeDSuiteInquiryWorkers) globalWorkers.__threeDSuiteInquiryWorkers = workers;
+// Per-license active runId: prevents starting the same run twice while still
+// allowing a new run to start even if an old-run promise is still draining.
+const activeRunIds = globalWorkers.__threeDSuiteInquiryActiveRunIds ?? new Map<string, string>();
+if (!globalWorkers.__threeDSuiteInquiryActiveRunIds) globalWorkers.__threeDSuiteInquiryActiveRunIds = activeRunIds;
 
 const INQUIRY_SCAN_TIMEOUT_MS = 75_000;
 const INQUIRY_SUBMIT_TIMEOUT_MS = 35_000;
@@ -52,8 +57,8 @@ async function responseJson(response: Response): Promise<any> {
 
 function assertWorkerActive(licenseId: string, runId: string): void {
   const state = getInquiryRunState(licenseId);
-  if (state.mode === 'stopped') throw new InquiryRunStoppedError();
-  if (state.runId && state.runId !== runId) throw new InquiryRunStoppedError();
+  if (state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
+  if (state.runId && state.runId !== runId) throw new InquiryRunStoppedError('stale_run_context');
 }
 
 class InquiryTargetTimeoutError extends Error {
@@ -190,14 +195,20 @@ export function startInquiryBackendWorker(args: {
   startIndex: number;
   profile: Record<string, unknown>;
 }): void {
+  // Prevent starting the same runId twice (idempotent call guard).
+  // A different runId for the same license is always allowed; the old worker
+  // will detect the mismatch on its next checkpoint and exit cleanly.
+  if (activeRunIds.get(args.licenseId) === args.runId) return;
+  activeRunIds.set(args.licenseId, args.runId);
+  console.info(`[inquiry-worker] runId=${args.runId} licenseId=${args.licenseId} isStopped=false controllers=created starting ${args.targets.length} targets`);
+
   const key = `${args.licenseId}:${args.runId}`;
-  if (workers.has(key)) return;
 
   const task = (async () => {
     try {
       let sessionGeneration = 1;
       for (let i = Math.max(0, args.startIndex); i < args.targets.length; i += 1) {
-        await inquiryCheckpoint(args.licenseId);
+        await inquiryCheckpoint(args.licenseId, args.runId);
         const state = getInquiryRunState(args.licenseId);
         if (state.runId && state.runId !== args.runId) return;
 
@@ -381,7 +392,7 @@ export function startInquiryBackendWorker(args: {
           transitionInquiryItemState(attempt, 'READY_TO_SUBMIT');
           addPhaseLog('success', `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}`);
           addPhaseLog('info', `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}`);
-          await inquiryCheckpoint(args.licenseId);
+          await inquiryCheckpoint(args.licenseId, args.runId);
           transitionInquiryItemState(attempt, 'SUBMITTING');
 
           let submitResponse: Response;
@@ -502,11 +513,16 @@ export function startInquiryBackendWorker(args: {
       });
     } catch (error) {
       const current = getInquiryRunState(args.licenseId);
+      const isStaleRunContext = error instanceof InquiryRunStoppedError && error.code === 'stale_run_context';
       const explicitlyStopped =
         error instanceof InquiryRunStoppedError ||
         current.mode === 'stopped' ||
         (current.runId && current.runId !== args.runId);
-      if (!explicitlyStopped) {
+      if (isStaleRunContext) {
+        console.info(`[inquiry-worker] runId=${args.runId} source=system exited: stale_run_context (superseded by new run)`);
+      } else if (explicitlyStopped) {
+        console.info(`[inquiry-worker] runId=${args.runId} source=user stopped at ${new Date().toISOString()}`);
+      } else {
         setInquiryRunState(args.licenseId, 'stopped', {
           runId: args.runId,
           sessionId: args.sessionId,

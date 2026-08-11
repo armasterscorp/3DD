@@ -893,7 +893,7 @@ export async function POST(request: NextRequest) {
     const rawAttemptId = String(body.attemptId || '').trim();
     const rawSessionGeneration = Number(body.sessionGeneration);
     const rawTargetIndex = Number(body.targetIndex);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     const attemptRef: InquiryAttemptRef | null = rawAttemptId && Number.isFinite(rawSessionGeneration) && rawSessionGeneration > 0 && Number.isFinite(rawTargetIndex)
       ? {
         licenseId,
@@ -1031,7 +1031,7 @@ export async function POST(request: NextRequest) {
       // Live monitor guarantee: let the dashboard render every target's landing
       // page before discovery can immediately navigate elsewhere or classify it.
       await visualActionPause(page, 900);
-      await inquiryCheckpoint(licenseId);
+      await inquiryCheckpoint(licenseId, runId);
       const unresolvedLandingCaptcha = await detectCaptcha(page);
       if (unresolvedLandingCaptcha.detected) {
         return await saveCaptchaClassification(unresolvedLandingCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected on the landing page before form discovery');
@@ -1057,14 +1057,14 @@ export async function POST(request: NextRequest) {
       throw navigationError;
     }
     await page.waitForTimeout(400);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
 
     const pageCaptcha = await detectCaptcha(page);
     if (pageCaptcha.detected) {
       return await saveCaptchaClassification(pageCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected before contact-form discovery');
     }
 
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     let discovery;
     try {
       discovery = await findContactPageAndForm(page);
@@ -1096,7 +1096,7 @@ export async function POST(request: NextRequest) {
     const discoveredPageUrl = String(page.url?.() || discovery.contactUrl || target);
     log('info', `contact form discovered on ${discoveredPageUrl}; checking CAPTCHA on contact page`);
     await page.waitForTimeout(350);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
 
     const captcha = await detectCaptcha(page, discovery.form);
     if (captcha.detected) {
@@ -1144,9 +1144,9 @@ export async function POST(request: NextRequest) {
       log('info', `no CAPTCHA on contact form ${discoveredPageUrl}`);
     }
 
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     const form = await fillForm(page, discovery.form, profile);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     if (form.captchaDetected) {
       session.targetUrl = target;
       session.contactUrl = discovery.contactUrl;
