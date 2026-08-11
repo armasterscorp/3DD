@@ -1,65 +1,3 @@
-<<<<<<< HEAD
-import axios, { AxiosInstance } from 'axios';
-
-export interface CaptchaTaskResult {
-  errorId: number;
-  errorDescription?: string;
-  status: string;
-  solution?: {
-    gRecaptchaResponse?: string;
-    token?: string;
-    text?: string;
-  };
-  cost: string;
-  ip: string;
-  createTime: number;
-  endTime?: number;
-  solveCount?: number;
-}
-
-export interface CaptchaTaskRequest {
-  type: string;
-  [key: string]: any;
-}
-
-export class TwoCaptchaSolver {
-  private apiKey: string;
-  private apiUrl = 'https://api.2captcha.com';
-  private axiosInstance: AxiosInstance;
-  private maxAttempts = 60; // 3 minutes with 3 second intervals
-  private pollInterval = 3000; // 3 seconds
-
-  constructor(apiKey: string) {
-    if (!apiKey || apiKey.trim().length === 0) {
-      throw new Error('2Captcha API key is required');
-    }
-    this.apiKey = apiKey.trim();
-    this.axiosInstance = axios.create({
-      timeout: 10000,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    });
-  }
-
-  /**
-   * Solve reCAPTCHA v2 (checkbox or invisible)
-   */
-  async solveRecaptchaV2(
-    websiteUrl: string,
-    websiteKey: string,
-    isInvisible: boolean = false
-  ): Promise<string> {
-    console.log(`[2Captcha] Solving reCAPTCHA v2 for ${websiteUrl}`);
-    const taskId = await this.createTask({
-      type: 'RecaptchaV2TaskProxyless',
-      websiteURL: websiteUrl,
-      websiteKey,
-      isInvisible,
-    });
-
-    return this.pollTaskResult(taskId);
-=======
 /**
  * 2Captcha Solver - In-Memory Version (No Database)
  * Uses official 2Captcha API endpoints based on their documentation
@@ -69,6 +7,41 @@ interface SolveResponse {
   success: boolean;
   captchaId?: string;
   error?: string;
+}
+
+/** Thrown when the local poll-attempt limit is reached. */
+export class CaptchaSolverTimeoutError extends Error {
+  public readonly code = 'captcha_solver_timeout' as const;
+  constructor(captchaId?: string) {
+    super(`Captcha solving timeout${captchaId ? ` (provider id: ${captchaId})` : ''}`);
+    this.name = 'CaptchaSolverTimeoutError';
+  }
+}
+
+/** Thrown when an AbortSignal fires while polling. */
+export class CaptchaCancelledError extends Error {
+  public readonly code = 'captcha_cancelled' as const;
+  constructor(reason?: string) {
+    super(`Captcha solve cancelled${reason ? `: ${reason}` : ''}`);
+    this.name = 'CaptchaCancelledError';
+  }
+}
+
+/** Options accepted by the public solve methods and pollForSolution. */
+export interface CaptchaSolveOptions {
+  /** Abort signal; when aborted the poll loop stops and CaptchaCancelledError is thrown. */
+  signal?: AbortSignal;
+  /**
+   * Called once with the provider-assigned captcha ID immediately after the
+   * in.php call succeeds.  Use it to update a job-registry entry.
+   */
+  onCaptchaId?: (id: string) => void;
+  /**
+   * Called on every poll tick so the caller can update `lastPollAt`.
+   */
+  onPollTick?: () => void;
+  /** Structured context included in every log line for this job. */
+  logContext?: { jobKey?: string; runId?: string; itemId?: string; attemptId?: string };
 }
 
 // In-memory storage for API keys per user
@@ -183,53 +156,38 @@ export class TwoCaptchaSolver {
   }
 
   /**
-   * Solve reCAPTCHA v2
+   * Solve reCAPTCHA v2 (standard or enterprise)
    */
-  async solveRecaptchaV2(pageUrl: string, siteKey: string): Promise<string> {
-    console.log(`[2Captcha] Solving reCAPTCHA v2 for ${pageUrl}`);
+  async solveRecaptchaV2(pageUrl: string, siteKey: string, isEnterprise = false, options?: CaptchaSolveOptions): Promise<string> {
+    console.log(`[2Captcha] Solving reCAPTCHA v2${isEnterprise ? ' Enterprise' : ''} for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
       method: 'userrecaptcha',
       googlekey: siteKey,
       pageurl: pageUrl,
+      ...(isEnterprise ? { enterprise: 1 } : {}),
     });
 
     if (!response.success) {
       throw new Error(response.error || 'Failed to submit captcha');
     }
 
-    return await this.pollForSolution(response.captchaId!);
->>>>>>> 4fa24fd (Inquiry captcha fixes)
+    options?.onCaptchaId?.(response.captchaId!);
+    return await this.pollForSolution(response.captchaId!, options);
   }
 
   /**
-   * Solve reCAPTCHA v3
+   * Solve reCAPTCHA v3 (standard or enterprise)
    */
   async solveRecaptchaV3(
-<<<<<<< HEAD
-    websiteUrl: string,
-    websiteKey: string,
-    minScore: number = 0.9,
-    pageAction?: string
-  ): Promise<string> {
-    console.log(`[2Captcha] Solving reCAPTCHA v3 for ${websiteUrl}`);
-    const taskId = await this.createTask({
-      type: 'RecaptchaV3TaskProxyless',
-      websiteURL: websiteUrl,
-      websiteKey,
-      minScore,
-      pageAction,
-      isEnterprise: false,
-    });
-
-    return this.pollTaskResult(taskId);
-=======
     pageUrl: string,
     siteKey: string,
     minScore: number = 0.9,
-    pageAction?: string
+    pageAction?: string,
+    isEnterprise = false,
+    options?: CaptchaSolveOptions
   ): Promise<string> {
-    console.log(`[2Captcha] Solving reCAPTCHA v3 for ${pageUrl}`);
+    console.log(`[2Captcha] Solving reCAPTCHA v3${isEnterprise ? ' Enterprise' : ''} for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
       method: 'userrecaptcha',
@@ -238,92 +196,21 @@ export class TwoCaptchaSolver {
       version: 'v3',
       action: pageAction || '',
       min_score: minScore,
+      ...(isEnterprise ? { enterprise: 1 } : {}),
     });
 
     if (!response.success) {
       throw new Error(response.error || 'Failed to submit captcha');
     }
 
-    return await this.pollForSolution(response.captchaId!);
->>>>>>> 4fa24fd (Inquiry captcha fixes)
+    options?.onCaptchaId?.(response.captchaId!);
+    return await this.pollForSolution(response.captchaId!, options);
   }
 
   /**
    * Solve Cloudflare Turnstile
    */
-<<<<<<< HEAD
-  async solveTurnstile(
-    websiteUrl: string,
-    websiteKey: string,
-    data?: string,
-    pagedata?: string,
-    action?: string
-  ): Promise<string> {
-    console.log(`[2Captcha] Solving Cloudflare Turnstile for ${websiteUrl}`);
-    const taskId = await this.createTask({
-      type: 'TurnstileTaskProxyless',
-      websiteURL: websiteUrl,
-      websiteKey,
-      data,
-      pagedata,
-      action,
-    });
-
-    return this.pollTaskResult(taskId);
-  }
-
-  /**
-   * Solve normal image captcha
-   */
-  async solveImageCaptcha(
-    base64Image: string,
-    options?: {
-      phrase?: boolean;
-      case?: boolean;
-      numeric?: number;
-      math?: boolean;
-      minLength?: number;
-      maxLength?: number;
-    }
-  ): Promise<string> {
-    console.log(`[2Captcha] Solving image captcha`);
-    const taskId = await this.createTask({
-      type: 'ImageToTextTask',
-      body: base64Image,
-      ...options,
-    });
-
-    return this.pollTaskResult(taskId);
-  }
-
-  /**
-   * Create a task in 2Captcha
-   */
-  private async createTask(task: CaptchaTaskRequest): Promise<string> {
-    try {
-      const response = await this.axiosInstance.post<any>(
-        `${this.apiUrl}/createTask`,
-        {
-          clientKey: this.apiKey,
-          task,
-          languagePool: 'en',
-        }
-      );
-
-      if (response.data.errorId && response.data.errorId !== 0) {
-        const errorMsg = response.data.errorDescription || 'Unknown error';
-        console.error(`[2Captcha] Task creation failed: ${errorMsg}`);
-        throw new Error(`2Captcha Error ${response.data.errorId}: ${errorMsg}`);
-      }
-
-      const taskId = response.data.taskId;
-      console.log(`[2Captcha] Task created: ${taskId}`);
-      return taskId;
-    } catch (error: any) {
-      console.error('[2Captcha] Failed to create task:', error.message);
-      throw error;
-=======
-  async solveTurnstile(pageUrl: string, websiteKey: string): Promise<string> {
+  async solveTurnstile(pageUrl: string, websiteKey: string, options?: CaptchaSolveOptions): Promise<string> {
     console.log(`[2Captcha] Solving Turnstile for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
@@ -336,13 +223,14 @@ export class TwoCaptchaSolver {
       throw new Error(response.error || 'Failed to submit captcha');
     }
 
-    return await this.pollForSolution(response.captchaId!);
+    options?.onCaptchaId?.(response.captchaId!);
+    return await this.pollForSolution(response.captchaId!, options);
   }
 
   /**
    * Solve hCaptcha
    */
-  async solveHcaptcha(pageUrl: string, siteKey: string): Promise<string> {
+  async solveHcaptcha(pageUrl: string, siteKey: string, options?: CaptchaSolveOptions): Promise<string> {
     console.log(`[2Captcha] Solving hCaptcha for ${pageUrl}`);
 
     const response = await this.sendCaptcha({
@@ -355,7 +243,8 @@ export class TwoCaptchaSolver {
       throw new Error(response.error || 'Failed to submit captcha');
     }
 
-    return await this.pollForSolution(response.captchaId!);
+    options?.onCaptchaId?.(response.captchaId!);
+    return await this.pollForSolution(response.captchaId!, options);
   }
 
   /**
@@ -363,7 +252,8 @@ export class TwoCaptchaSolver {
    */
   async solveImageCaptcha(
     base64Image: string,
-    options?: { numeric?: number; minLen?: number; maxLen?: number }
+    options?: { numeric?: number; minLen?: number; maxLen?: number },
+    solveOptions?: CaptchaSolveOptions
   ): Promise<string> {
     console.log('[2Captcha] Solving image CAPTCHA');
 
@@ -377,7 +267,8 @@ export class TwoCaptchaSolver {
       throw new Error(response.error || 'Failed to submit captcha');
     }
 
-    return await this.pollForSolution(response.captchaId!);
+    solveOptions?.onCaptchaId?.(response.captchaId!);
+    return await this.pollForSolution(response.captchaId!, solveOptions);
   }
 
   /**
@@ -435,117 +326,41 @@ export class TwoCaptchaSolver {
     } catch (error: any) {
       console.error('[2Captcha] Send error:', error);
       return { success: false, error: error.message || 'Network error' };
->>>>>>> 4fa24fd (Inquiry captcha fixes)
     }
   }
 
   /**
-<<<<<<< HEAD
-   * Poll for task result with exponential backoff
+   * Poll for solution — abortable, with throttled logging (every 4 polls).
+   *
+   * Throws CaptchaSolverTimeoutError when maxAttempts is reached.
+   * Throws CaptchaCancelledError when the AbortSignal fires.
    */
-  private async pollTaskResult(taskId: string): Promise<string> {
-    let attempt = 0;
-    let backoffMs = this.pollInterval;
+  private async pollForSolution(captchaId: string, options?: CaptchaSolveOptions): Promise<string> {
+    const { signal, onPollTick, logContext } = options ?? {};
+    const ctxTag = logContext
+      ? ` [runId=${logContext.runId ?? '?'} item=${logContext.itemId ?? '?'} attempt=${logContext.attemptId ?? '?'} job=${logContext.jobKey ?? captchaId}]`
+      : ` [captchaId=${captchaId}]`;
 
-    while (attempt < this.maxAttempts) {
-      await this.sleep(backoffMs);
-
-      try {
-        const response = await this.axiosInstance.post<CaptchaTaskResult>(
-          `${this.apiUrl}/getTaskResult`,
-          {
-            clientKey: this.apiKey,
-            taskId,
-          }
-        );
-
-        if (response.data.errorId && response.data.errorId !== 0) {
-          const errorMsg = response.data.errorDescription || 'Unknown error';
-          console.error(`[2Captcha] Task ${taskId} error: ${errorMsg}`);
-          throw new Error(`Task error: ${errorMsg}`);
-        }
-
-        if (response.data.status === 'ready') {
-          const solution =
-            response.data.solution?.gRecaptchaResponse ||
-            response.data.solution?.token ||
-            response.data.solution?.text;
-
-          console.log(`[2Captcha] Task ${taskId} solved in ${attempt + 1} attempts`);
-          return solution;
-        }
-
-        // Increase backoff for next attempt
-        backoffMs = Math.min(backoffMs + 500, 5000);
-      } catch (error: any) {
-        console.error(`[2Captcha] Poll attempt ${attempt + 1} failed:`, error.message);
-        // Continue polling on error
-      }
-
-      attempt++;
-    }
-
-    const timeoutMsg = `Captcha solving timeout after ${this.maxAttempts} attempts`;
-    console.error(`[2Captcha] ${timeoutMsg}`);
-    throw new Error(timeoutMsg);
-  }
-
-  /**
-   * Test API key connectivity
-   */
-  async testConnection(): Promise<{ success: boolean; error?: string }> {
-    try {
-      const response = await this.axiosInstance.post(
-        `${this.apiUrl}/getBalance`,
-        {
-          clientKey: this.apiKey,
-        },
-        { timeout: 5000 }
-      );
-
-      if (response.data.errorId && response.data.errorId !== 0) {
-        return {
-          success: false,
-          error: response.data.errorDescription || 'Invalid API key',
-        };
-      }
-
-      console.log(`[2Captcha] Connection successful. Balance: ${response.data.balance}`);
-      return { success: true };
-    } catch (error: any) {
-      const msg = error.message || 'Connection test failed';
-      console.error(`[2Captcha] Connection test failed: ${msg}`);
-      return { success: false, error: msg };
-    }
-  }
-
-  /**
-   * Report incorrect solution (request refund)
-   */
-  async reportIncorrect(taskId: string): Promise<void> {
-    try {
-      await this.axiosInstance.post(`${this.apiUrl}/reportIncorrect`, {
-        clientKey: this.apiKey,
-        taskId,
-      });
-      console.log(`[2Captcha] Reported task ${taskId} as incorrect`);
-    } catch (error: any) {
-      console.error(`[2Captcha] Failed to report incorrect: ${error.message}`);
-    }
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-=======
-   * Poll for solution
-   */
-  private async pollForSolution(captchaId: string): Promise<string> {
     let attempts = 0;
 
     while (attempts < this.maxAttempts) {
+      // Check abort signal before each sleep.
+      if (signal?.aborted) {
+        throw new CaptchaCancelledError(String(signal.reason ?? 'aborted'));
+      }
+
       await new Promise((resolve) => setTimeout(resolve, this.pollInterval));
+
+      // Check again after the sleep (the signal may have fired during the wait).
+      if (signal?.aborted) {
+        throw new CaptchaCancelledError(String(signal.reason ?? 'aborted'));
+      }
+
       attempts++;
+      onPollTick?.();
+
+      // Log every 4th poll attempt and on the first one.
+      const shouldLog = attempts === 1 || attempts % 4 === 0;
 
       try {
         const params = new URLSearchParams();
@@ -557,14 +372,16 @@ export class TwoCaptchaSolver {
         const response = await fetch(`${this.resUrl}?${params.toString()}`);
         const responseText = await response.text();
 
-        console.log('[2Captcha] Poll attempt', attempts, '- response:', responseText.substring(0, 100));
+        if (shouldLog) {
+          console.log(`[2Captcha] Poll attempt ${attempts}/${this.maxAttempts}${ctxTag} — ${responseText.substring(0, 80)}`);
+        }
 
         // Try JSON
         try {
           const data = JSON.parse(responseText);
 
           if (data.status === 1) {
-            console.log(`[2Captcha] Solution received for captcha ${captchaId}`);
+            console.log(`[2Captcha] Solution received${ctxTag}`);
             return data.request;
           }
 
@@ -580,7 +397,7 @@ export class TwoCaptchaSolver {
           if (responseText.startsWith('OK')) {
             const parts = responseText.split('|');
             if (parts[1]) {
-              console.log(`[2Captcha] Solution received for captcha ${captchaId}`);
+              console.log(`[2Captcha] Solution received${ctxTag}`);
               return parts[1];
             }
           }
@@ -592,12 +409,14 @@ export class TwoCaptchaSolver {
           }
         }
       } catch (error: any) {
-        console.error('[2Captcha] Poll error:', error.message);
+        // Re-throw typed errors without wrapping.
+        if (error instanceof CaptchaCancelledError || error instanceof CaptchaSolverTimeoutError) throw error;
+        if (shouldLog) console.error('[2Captcha] Poll error', ctxTag, error.message);
         continue;
       }
     }
 
-    throw new Error('Captcha solving timeout');
+    throw new CaptchaSolverTimeoutError(captchaId);
   }
 
   /**
@@ -647,5 +466,4 @@ export function getUserApiKey(userId: string): string | null {
 export function clearUserApiKey(userId: string): void {
   apiKeyStore.delete(userId);
   console.log(`[2Captcha] API key cleared for user ${userId}`);
->>>>>>> 4fa24fd (Inquiry captcha fixes)
 }

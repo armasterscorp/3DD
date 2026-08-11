@@ -32,10 +32,12 @@ dist-ssr
 .next
 out
 build
+*.tsbuildinfo
 
 # Queue and cache
 .bull
 .cache
+.3dsuite-data/
 
 # Prisma
 prisma/migrations

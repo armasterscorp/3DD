@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { closeInquirySession } from '@/lib/inquiry-browser-store';
-import { getInquiryLicenseId, getInquiryRunState, setInquiryRunState } from '@/lib/inquiry-run-store';
+import {
+  createInquiryRunContext,
+  getInquiryLicenseId,
+  getInquiryRunState,
+  setInquiryRunState,
+  stopInquiryRunContext,
+} from '@/lib/inquiry-run-store';
 import { startInquiryBackendWorker } from '@/lib/inquiry-backend-worker';
 
 export const runtime = 'nodejs';
@@ -28,6 +34,8 @@ export async function POST(request: NextRequest) {
     const currentTarget = String(body.currentTarget || '').trim() || undefined;
     if (!['start', 'pause', 'resume', 'stop', 'progress'].includes(action)) throw new Error('Invalid Inquiry control action.');
     const previous = getInquiryRunState(licenseId);
+    if (action === 'start' && runId) createInquiryRunContext(licenseId, runId);
+    if (action === 'stop') stopInquiryRunContext(licenseId, previous.runId || runId);
     const mode = action === 'pause' ? 'paused' : action === 'stop' ? 'stopped' : action === 'progress' ? previous.mode : 'running';
     const state = setInquiryRunState(licenseId, mode, { sessionId, runId, targets, totalTargets, index, currentTarget });
     if (action === 'start' && body.autoSubmit !== false && runId && sessionId && targets?.length) {

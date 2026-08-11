@@ -11,7 +11,8 @@
     "type-check": "turbo run type-check",
     "db:push": "cd packages/db && prisma db push",
     "db:generate": "cd packages/db && prisma generate",
-    "db:studio": "cd packages/db && prisma studio"
+    "db:studio": "cd packages/db && prisma studio",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/nodemailer": "^8.0.1",

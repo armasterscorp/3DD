@@ -37,6 +37,7 @@
     "@types/nodemailer": "^6.4.13",
     "@types/papaparse": "^5.3.7",
     "@types/pdfkit": "^0.12.10",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.10"
   }
 }

@@ -3,9 +3,23 @@ import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-
 import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
 import { CaptchaStore } from '@/lib/captcha-store';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
+import {
+  formatAttemptStep,
+  isActiveInquiryItemAttempt,
+  markInquiryItemCaptchaDetected,
+  renewInquiryItemOperation,
+  type InquiryAttemptRef,
+} from '@/lib/inquiry-item-lifecycle';
+import {
+  createCaptchaClassificationState,
+  lockCaptchaClassification,
+  mapCaptchaTerminalReason,
+  markCaptchaSolved,
+} from '@/lib/inquiry-submit-captcha-policy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+const INQUIRY_CAPTCHA_TIMEOUT_MS = 75_000;
 
 type Profile = {
   firstName?: string;
@@ -811,7 +825,7 @@ async function fillForm(page: any, chosen: any, profile: Profile) {
     } else if (hasAnySignal(signals, companyPatterns)) {
       value = companyOrName;
       kind = 'company';
-    } else if (hasAnySignal(signals, [/subject|topic|reason|regarding|nature of inquiry|inquiry type|enquiry type|how can we help|what can we help|sujet|objet|raison|motif|nature de la demande|type de demande|comment pouvons nous vous aider/])) {
+    } else if (tag !== 'textarea' && hasAnySignal(signals, [/subject|topic|reason|regarding|nature of inquiry|inquiry type|enquiry type|what can we help|sujet|objet|raison|motif|nature de la demande|type de demande/])) {
       value = profile.subject || '';
       kind = 'subject';
     } else if (tag === 'textarea' || hasAnySignal(signals, [/message|comment|inquiry|enquiry|description|details|how can we help|tell us|project details|additional information|question|notes|briefly describe|commentaire|demande|détails|details|renseignements supplémentaires|renseignements supplementaires|décrivez|decrivez/])) {
@@ -883,64 +897,151 @@ export async function POST(request: NextRequest) {
     const profile: Profile = body.profile || {};
     licenseId = getInquiryLicenseId(request);
     runId = String(body.runId || '').trim() || `run_${Date.now().toString(36)}`;
-    await inquiryCheckpoint(licenseId);
+    const rawAttemptId = String(body.attemptId || '').trim();
+    const rawSessionGeneration = Number(body.sessionGeneration);
+    const rawTargetIndex = Number(body.targetIndex);
+    await inquiryCheckpoint(licenseId, runId);
+    const attemptRef: InquiryAttemptRef | null = rawAttemptId && Number.isFinite(rawSessionGeneration) && rawSessionGeneration > 0 && Number.isFinite(rawTargetIndex)
+      ? {
+        licenseId,
+        runId,
+        target,
+        index: Math.max(0, rawTargetIndex),
+        attemptId: rawAttemptId,
+        sessionGeneration: Math.floor(rawSessionGeneration),
+      }
+      : null;
+    const isAttemptActive = () => !attemptRef || isActiveInquiryItemAttempt(attemptRef);
+    const getCaptchaAttemptSignal = () => (attemptRef ? renewInquiryItemOperation(attemptRef, 'captcha') : null);
+    const attemptTag = (message: string) => attemptRef ? formatAttemptStep(message, attemptRef) : message;
+    const log = (level: 'info' | 'success' | 'warning' | 'error', message: string) => {
+      if (!isAttemptActive()) return;
+      addInquiryLog({
+        licenseId,
+        runId,
+        level,
+        message: attemptTag(message),
+        attemptId: attemptRef?.attemptId,
+        sessionGeneration: attemptRef?.sessionGeneration,
+        targetIndex: attemptRef?.index,
+        target,
+      });
+    };
+    const storeResult = (input: Omit<Parameters<typeof addInquiryResult>[0], 'licenseId' | 'runId' | 'sessionId' | 'target'>) => {
+      if (!isAttemptActive()) return null;
+      return addInquiryResult({
+        ...input,
+        licenseId,
+        runId,
+        sessionId,
+        target,
+        attemptId: attemptRef?.attemptId,
+        sessionGeneration: attemptRef?.sessionGeneration,
+        targetIndex: attemptRef?.index,
+      });
+    };
+    const throwIfStale = () => {
+      if (!isAttemptActive()) throw new InquiryRunStoppedError('stale_run_context');
+    };
     const session = await getInquirySession(sessionId, licenseId, true);
     if (!session) throw new Error('Unable to create Inquiry browser session.');
     session.profile = profile as Record<string, unknown>;
     session.runId = runId;
     session.licenseId = licenseId;
     const { page } = session;
+    const captchaState = createCaptchaClassificationState();
+    const lockCaptcha = (provider?: string) => {
+      lockCaptchaClassification(captchaState, provider);
+      if (attemptRef) markInquiryItemCaptchaDetected(attemptRef, provider);
+    };
     const captchaConfig = await CaptchaStore.getCaptchaConfig(licenseId);
     const savedApiKey = captchaConfig?.isActive ? captchaConfig.apiKey : '';
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
-    const solvePreloadCaptcha = async () => {
-      if (!captchaHandler) return { status: 'unconfigured' as const };
+    // Attempt to auto-solve any CAPTCHA on the current page.
+    // Logging rules (single state-machine, no contradictions):
+    //   • "solver unavailable"  – API key not configured; emitted once per run.
+    //   • "✓ CAPTCHA cleared"   – token accepted, page no longer shows a challenge.
+    //   • "CAPTCHA still required" – token returned but page still blocked.
+    //   • "⚠ CAPTCHA solving failed" – solver threw or timed out.
+    // The "no CAPTCHA detected" signal is intentionally NOT emitted here because
+    // the caller always performs its own authoritative detectCaptcha() check
+    // afterwards; emitting it inside the solver would produce contradictory log
+    // pairs ("no CAPTCHA detected" → "CAPTCHA detected on the landing page").
+    const solveActiveFormCaptcha = async (activeForm: any, contextLabel: string) => {
+      if (!captchaHandler) {
+        log('info', 'CAPTCHA auto-solver not configured — CAPTCHA will not be solved automatically');
+        return { status: 'solver_unavailable' as const };
+      }
+      if (!activeForm) return { handled: false, status: 'not_found' as const };
+      const detectedOnActiveForm = await detectCaptcha(page, activeForm);
+      if (!detectedOnActiveForm.detected) return { handled: false, status: 'not_found' as const };
+      lockCaptcha(detectedOnActiveForm.provider);
       const captchaCheckUrl = String(page.url?.() || target);
-      addInquiryLog({ licenseId, runId, level: 'info', message: `checking CAPTCHA on ${captchaCheckUrl}` });
+      const captchaSignal = getCaptchaAttemptSignal();
+      if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
+      log('info', `${contextLabel} on ${captchaCheckUrl}`);
       try {
         const result = await Promise.race([
-          captchaHandler.handleCaptcha(page),
+          captchaHandler.handleCaptcha(page, { attemptRef: attemptRef ?? undefined, signal: captchaSignal ?? undefined }),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
-            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 75 seconds' }), 75_000)
+            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'captcha_timeout_after_75_seconds' }), INQUIRY_CAPTCHA_TIMEOUT_MS)
           ),
+          new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) => {
+            if (!captchaSignal) return;
+            if (captchaSignal.aborted) return resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' });
+            captchaSignal.addEventListener('abort', () => resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' }), { once: true });
+          }),
         ]);
+        if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
         if (result.status === 'solved') {
           // A solver returning a token is not the same thing as the page accepting
           // the CAPTCHA. Verify the live page before reporting completion.
           await page.waitForTimeout(450).catch(() => undefined);
-          const stillRequired = await detectCaptcha(page);
+          const stillRequired = await detectCaptcha(page, activeForm);
+          if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
           if (stillRequired.detected) {
-            addInquiryLog({
-              licenseId,
-              runId,
-              level: 'warning',
-              message: `CAPTCHA solution returned, but ${stillRequired.provider || 'CAPTCHA'} is still required on ${String(page.url?.() || captchaCheckUrl)}`,
-            });
+            log('warning', `CAPTCHA solution returned, but ${stillRequired.provider || 'CAPTCHA'} is still required on ${String(page.url?.() || captchaCheckUrl)}`);
+            return { handled: false, status: 'failed' as const, error: 'captcha_unsolved_after_token' };
           } else {
-            addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA cleared on ${String(page.url?.() || captchaCheckUrl)}` });
+            markCaptchaSolved(captchaState, detectedOnActiveForm.provider);
+            log('success', `✓ CAPTCHA cleared on ${String(page.url?.() || captchaCheckUrl)}`);
           }
-        } else if (result.status === 'not_found') {
-          addInquiryLog({ licenseId, runId, level: 'info', message: `no CAPTCHA detected on ${String(page.url?.() || captchaCheckUrl)}` });
         } else if (result.status === 'failed') {
-          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+          if (result.error !== 'attempt_cancelled' && result.error !== 'attempt_stale') {
+            log('warning', `⚠ CAPTCHA solving failed, continuing anyway${'error' in result && result.error ? ` (${result.error})` : ''}`);
+          }
         }
+        // 'not_found' and 'solver_unavailable' produce no log here; the caller's
+        // detectCaptcha() check provides the definitive state-machine transition.
         return result;
       } catch (error) {
-        addInquiryLog({
-          licenseId,
-          runId,
-          level: 'warning',
-          message: `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`,
-        });
+        log('warning', `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`);
         return { handled: false, status: 'failed' as const };
       }
     };
-    const saveCaptchaClassification = async (provider: string, reason: string, contactUrl?: string) => {
+    const saveCaptchaClassification = async (
+      provider: string,
+      reason: string,
+      contactUrl?: string,
+      primaryReason = 'captcha_detected_autoskip',
+      failureDetail = reason
+    ) => {
       const url = contactUrl || page.url() || target;
+      lockCaptcha(provider);
       session.targetUrl = target;
       session.contactUrl = url;
       session.lastPreparedAt = new Date().toISOString();
-      const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: url, captchaProvider: provider || 'CAPTCHA', reason, values: profile as Record<string, unknown> });
+      const result = storeResult({
+        status: 'captcha',
+        contactUrl: url,
+        captchaProvider: provider || 'CAPTCHA',
+        captchaDetected: true,
+        captchaType: provider || 'CAPTCHA',
+        primaryReason,
+        failureDetail,
+        reason,
+        values: profile as Record<string, unknown>,
+      });
       await visualActionPause(page, 1200);
       return NextResponse.json({
         success: true,
@@ -949,19 +1050,23 @@ export async function POST(request: NextRequest) {
         contactUrl: url,
         currentUrl: page.url() || url,
         captchaDetected: true,
+        captchaClassificationLocked: true,
         captchaProvider: provider || 'CAPTCHA',
+        captchaType: provider || 'CAPTCHA',
+        primaryReason,
+        failureDetail,
         detected: [], extras: [], submitVisible: false, fieldCount: 0,
-        resultId: result.id,
+        resultId: result?.id,
       });
     };
 
     try {
+      throwIfStale();
       await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 15_000 });
       // Live monitor guarantee: let the dashboard render every target's landing
       // page before discovery can immediately navigate elsewhere or classify it.
       await visualActionPause(page, 900);
-      await inquiryCheckpoint(licenseId);
-      await solvePreloadCaptcha();
+      await inquiryCheckpoint(licenseId, runId);
       const unresolvedLandingCaptcha = await detectCaptcha(page);
       if (unresolvedLandingCaptcha.detected) {
         return await saveCaptchaClassification(unresolvedLandingCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected on the landing page before form discovery');
@@ -969,14 +1074,10 @@ export async function POST(request: NextRequest) {
     } catch (navigationError) {
       const challenge = await detectCaptcha(page);
       if (challenge.detected) {
-        await solvePreloadCaptcha();
-        const unresolvedChallenge = await detectCaptcha(page);
-        if (unresolvedChallenge.detected) {
-          return await saveCaptchaClassification(unresolvedChallenge.provider || 'CAPTCHA', 'CAPTCHA/human verification blocked page navigation');
-        }
+        return await saveCaptchaClassification(challenge.provider || 'CAPTCHA', 'CAPTCHA/human verification blocked page navigation');
       }
       if (isUnavailableNavigationError(navigationError)) {
-        addInquiryResult({ licenseId, runId, sessionId, status: 'failed', target, contactUrl: page.url() || target, reason: shortUnavailableReason(navigationError), values: profile as Record<string, unknown> });
+        storeResult({ status: 'failed', contactUrl: page.url() || target, reason: shortUnavailableReason(navigationError), values: profile as Record<string, unknown> });
         return NextResponse.json({
           success: true,
           classification: 'site_unavailable',
@@ -991,25 +1092,21 @@ export async function POST(request: NextRequest) {
       throw navigationError;
     }
     await page.waitForTimeout(400);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
 
     const pageCaptcha = await detectCaptcha(page);
     if (pageCaptcha.detected) {
-      await solvePreloadCaptcha();
-      const unresolvedPageCaptcha = await detectCaptcha(page);
-      if (unresolvedPageCaptcha.detected) {
-        return await saveCaptchaClassification(unresolvedPageCaptcha.provider || pageCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected before contact-form discovery');
-      }
+      return await saveCaptchaClassification(pageCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected before contact-form discovery');
     }
 
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     let discovery;
     try {
       discovery = await findContactPageAndForm(page);
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
       if (text.startsWith('NO_FORM:')) {
-        addInquiryResult({ licenseId, runId, sessionId, status: 'failed', target, contactUrl: page.url(), reason: text.replace(/^NO_FORM:\s*/, ''), values: profile as Record<string, unknown> });
+        storeResult({ status: 'failed', contactUrl: page.url(), reason: text.replace(/^NO_FORM:\s*/, ''), values: profile as Record<string, unknown> });
         // Show the last inspected page briefly before the worker moves on.
         await visualActionPause(page, 1600);
         return NextResponse.json({
@@ -1030,62 +1127,80 @@ export async function POST(request: NextRequest) {
     // cross domains). Always perform a fresh CAPTCHA checkpoint on the page
     // that actually contains the discovered form. This prevents the earlier
     // landing-page "no CAPTCHA" result from being mistaken for the form page.
+    // Checkpoint 2 of the 3-check flow: homepage → **contact page** → post-submit.
     const discoveredPageUrl = String(page.url?.() || discovery.contactUrl || target);
-    addInquiryLog({
-      licenseId,
-      runId,
-      level: 'info',
-      message: `contact form discovered on ${discoveredPageUrl}; checking CAPTCHA on contact page`,
-    });
+    log('info', `contact form discovered on ${discoveredPageUrl}; checking CAPTCHA on contact page`);
     await page.waitForTimeout(350);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
 
     const captcha = await detectCaptcha(page, discovery.form);
     if (captcha.detected) {
       const provider = captcha.provider || 'CAPTCHA';
-      addInquiryLog({
-        licenseId,
-        runId,
-        level: 'warning',
-        message: `CAPTCHA detected (${provider}) on contact form ${discoveredPageUrl}`,
-      });
-      session.targetUrl = target;
-      session.contactUrl = discoveredPageUrl;
-      session.lastPreparedAt = new Date().toISOString();
-      addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discoveredPageUrl, captchaProvider: provider, reason: 'CAPTCHA detected on inquiry form after contact-page navigation', values: profile as Record<string, unknown> });
-      await visualActionPause(page, 2200);
-      return NextResponse.json({
-        success: true,
-        classification: 'captcha',
-        target,
-        contactUrl: discoveredPageUrl,
-        currentUrl: page.url(),
-        discovery: discovery.discovery,
-        captchaDetected: true,
-        captchaProvider: provider,
-        detected: [], extras: [], submitVisible: false, fieldCount: 0,
-      });
+      lockCaptcha(provider);
+      log('warning', `CAPTCHA detected (${provider}) on contact form ${discoveredPageUrl}; attempting auto-solve`);
+      // Attempt to solve at checkpoint 2 before giving up.
+      const solveResult = await solveActiveFormCaptcha(discovery.form, 'attempting to solve CAPTCHA on active contact form');
+      if (solveResult.status === 'failed' && solveResult.error === 'captcha_unsolved_after_token') {
+        return await saveCaptchaClassification(
+          provider,
+          'CAPTCHA token returned but the challenge is still required on the active form',
+          discoveredPageUrl,
+          'captcha_unsolved_after_token',
+          'captcha_unsolved_after_token'
+        );
+      }
+      const unresolvedContactCaptcha = await detectCaptcha(page, discovery.form);
+      if (unresolvedContactCaptcha.detected) {
+        const unresolvedProvider = unresolvedContactCaptcha.provider || provider;
+        log('warning', `CAPTCHA (${unresolvedProvider}) still present on ${discoveredPageUrl} after solve attempt; saved and skipped`);
+        const primaryReason = mapCaptchaTerminalReason({
+          captchaDetected: captchaState.captchaDetected,
+          captchaClassificationLocked: captchaState.captchaClassificationLocked,
+          tokenReturned: captchaState.tokenReturned,
+          captchaStillPresent: true,
+          solverTimedOut: solveResult.status === 'failed' && solveResult.error === 'captcha_timeout_after_75_seconds',
+          solverFailed: solveResult.status === 'failed' || solveResult.status === 'solver_unavailable',
+          autoskip: solveResult.status === 'not_found',
+        }) || 'captcha_detected_autoskip';
+        return await saveCaptchaClassification(
+          unresolvedProvider,
+          'CAPTCHA detected on inquiry form after contact-page navigation',
+          discoveredPageUrl,
+          primaryReason,
+          solveResult.status === 'failed' && solveResult.error
+            ? solveResult.error
+            : 'captcha_still_present_after_prepare'
+        );
+      }
+      log('success', `✓ CAPTCHA cleared on contact form ${discoveredPageUrl}`);
+    } else {
+      log('info', `no CAPTCHA on contact form ${discoveredPageUrl}`);
     }
 
-    addInquiryLog({
-      licenseId,
-      runId,
-      level: 'info',
-      message: `no CAPTCHA detected on contact form ${discoveredPageUrl}`,
-    });
-
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     const form = await fillForm(page, discovery.form, profile);
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
     if (form.captchaDetected) {
+      lockCaptcha(form.captchaProvider || 'CAPTCHA');
       session.targetUrl = target;
       session.contactUrl = discovery.contactUrl;
       session.lastPreparedAt = new Date().toISOString();
-      addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discovery.contactUrl, captchaProvider: form.captchaProvider || 'CAPTCHA', reason: 'CAPTCHA detected after form preparation', values: profile as Record<string, unknown> });
+      storeResult({
+        status: 'captcha',
+        contactUrl: discovery.contactUrl,
+        captchaProvider: form.captchaProvider || 'CAPTCHA',
+        captchaDetected: true,
+        captchaType: form.captchaProvider || 'CAPTCHA',
+        primaryReason: 'captcha_detected_autoskip',
+        failureDetail: 'captcha_detected_after_form_preparation',
+        reason: 'CAPTCHA detected after form preparation',
+        values: profile as Record<string, unknown>,
+      });
       await visualActionPause(page, 2200);
       return NextResponse.json({
         success: true, classification: 'captcha', target, contactUrl: discovery.contactUrl, currentUrl: page.url(), discovery: discovery.discovery,
-        captchaDetected: true, captchaProvider: form.captchaProvider || 'CAPTCHA',
+        captchaDetected: true, captchaClassificationLocked: true, captchaProvider: form.captchaProvider || 'CAPTCHA', captchaType: form.captchaProvider || 'CAPTCHA',
+        primaryReason: 'captcha_detected_autoskip', failureDetail: 'captcha_detected_after_form_preparation',
         detected: form.detected || [], extras: form.extras || [], submitVisible: false, fieldCount: form.fieldCount || 0,
       });
     }
@@ -1096,7 +1211,7 @@ export async function POST(request: NextRequest) {
 
     if (Array.isArray(form.extras) && form.extras.length > 0) {
       const reason = `Manual review required: ${form.extras.length} required/unsupported field(s) still need input — ${form.extras.join(', ')}`;
-      addInquiryResult({ licenseId, runId, sessionId, status: 'review', target, contactUrl: discovery.contactUrl, reason, values: profile as Record<string, unknown> });
+      storeResult({ status: 'review', contactUrl: discovery.contactUrl, reason, values: profile as Record<string, unknown> });
       return NextResponse.json({
         success: true,
         classification: 'review_required',
@@ -1126,7 +1241,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, code: 'RUN_STOPPED', error: error.message }, { status: 409 });
     }
     if (target && isUnavailableNavigationError(error)) {
-      try { if (licenseId) addInquiryResult({ licenseId, runId: runId || 'unknown', sessionId, status: 'failed', target, contactUrl: target, reason: shortUnavailableReason(error) }); } catch {}
+      try {
+        if (licenseId) {
+          addInquiryResult({ licenseId, runId: runId || 'unknown', sessionId, status: 'failed', target, contactUrl: target, reason: shortUnavailableReason(error) });
+        }
+      } catch {}
       return NextResponse.json({
         success: true,
         classification: 'site_unavailable',
@@ -1139,7 +1258,9 @@ export async function POST(request: NextRequest) {
       });
     }
     try {
-      if (licenseId && target) addInquiryResult({ licenseId, runId: runId || 'unknown', sessionId, status: 'failed', target, contactUrl: target, reason: error instanceof Error ? error.message : String(error) });
+      if (licenseId && target) {
+        addInquiryResult({ licenseId, runId: runId || 'unknown', sessionId, status: 'failed', target, contactUrl: target, reason: error instanceof Error ? error.message : String(error) });
+      }
     } catch {}
     return NextResponse.json({ success: false, error: error instanceof Error ? error.message : String(error) }, { status: 400 });
   }

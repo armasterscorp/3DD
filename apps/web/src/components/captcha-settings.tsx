@@ -1,10 +1,6 @@
 'use client';
 
-<<<<<<< HEAD
-import { useState } from 'react';
-=======
-import { useState, useEffect } from 'react';
->>>>>>> 4fa24fd (Inquiry captcha fixes)
+import { useEffect, useState } from 'react';
 import axios from 'axios';
 
 interface CaptchaConfig {
@@ -22,48 +18,28 @@ export function CaptchaSettings() {
   const [config, setConfig] = useState<CaptchaConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-<<<<<<< HEAD
-=======
-  const [userId, setUserId] = useState<string>('test-user');
 
-  // Initialize axios with x-user-id header
+  const getRequestConfig = () => ({
+    headers: {
+      'x-user-id':
+        typeof window !== 'undefined' ? localStorage.getItem('userId') || 'test-user' : 'test-user',
+    },
+  });
+
   useEffect(() => {
-    // Set default userId from localStorage or use test-user
-    const storedUserId = localStorage.getItem('userId') || 'test-user';
-    setUserId(storedUserId);
-
-    // Configure axios to include x-user-id header in all requests
-    axios.interceptors.request.use((config) => {
-      config.headers['x-user-id'] = storedUserId;
-      return config;
-    });
-
-    // Load config on mount
     loadConfig();
   }, []);
->>>>>>> 4fa24fd (Inquiry captcha fixes)
 
   // Load current config
   const loadConfig = async () => {
     try {
-<<<<<<< HEAD
-      const response = await axios.get('/api/captcha/config');
-      setConfig(response.data);
-    } catch (err: any) {
-      console.error('Failed to load config:', err);
-=======
-      const response = await axios.get('/api/captcha/config', {
-        headers: {
-          'x-user-id': userId || 'test-user',
-        },
-      });
+      const response = await axios.get('/api/captcha/config', getRequestConfig());
       setConfig(response.data);
     } catch (err: any) {
       console.error('Failed to load config:', err);
       if (err.response?.status === 401) {
         setError('Unauthorized - User ID not found');
       }
->>>>>>> 4fa24fd (Inquiry captcha fixes)
     }
   };
 
@@ -79,33 +55,20 @@ export function CaptchaSettings() {
     setSuccess(null);
 
     try {
-<<<<<<< HEAD
-      const response = await axios.post('/api/captcha/config', {
-        apiKey: apiKey.trim(),
-      });
-=======
-      const response = await axios.post(
+      await axios.post(
         '/api/captcha/config',
         {
           apiKey: apiKey.trim(),
         },
-        {
-          headers: {
-            'x-user-id': userId || 'test-user',
-          },
-        }
+        getRequestConfig()
       );
->>>>>>> 4fa24fd (Inquiry captcha fixes)
 
       setSuccess('✓ 2Captcha API key saved and tested successfully');
       setApiKey('');
       await loadConfig();
     } catch (err: any) {
-      const msg = err.response?.data?.error || err.message || 'Failed to save API key';
-<<<<<<< HEAD
-=======
       console.error('Save API key error:', err.response?.data);
->>>>>>> 4fa24fd (Inquiry captcha fixes)
+      const msg = err.response?.data?.error || err.message || 'Failed to save API key';
       setError(`✗ ${msg}`);
     } finally {
       setLoading(false);
