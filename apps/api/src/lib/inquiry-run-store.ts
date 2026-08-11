@@ -15,6 +15,9 @@ export type InquiryStoredResult = {
   reason?: string;
   captchaProvider?: string;
   values?: Record<string, unknown>;
+  attemptId?: string;
+  sessionGeneration?: number;
+  targetIndex?: number;
   createdAt: string;
 };
 
@@ -24,6 +27,10 @@ export type InquiryStoredLog = {
   runId: string;
   level: 'info' | 'success' | 'warning' | 'error';
   message: string;
+  attemptId?: string;
+  sessionGeneration?: number;
+  targetIndex?: number;
+  target?: string;
   createdAt: string;
 };
 
@@ -122,7 +129,16 @@ export function addInquiryResult(input: Omit<InquiryStoredResult, 'id' | 'create
   return result;
 }
 
-export function addInquiryLog(input: { licenseId: string; runId: string; level: 'info' | 'success' | 'warning' | 'error'; message: string }): InquiryStoredLog {
+export function addInquiryLog(input: {
+  licenseId: string;
+  runId: string;
+  level: 'info' | 'success' | 'warning' | 'error';
+  message: string;
+  attemptId?: string;
+  sessionGeneration?: number;
+  targetIndex?: number;
+  target?: string;
+}): InquiryStoredLog {
   const licenseId = safeLicenseId(input.licenseId);
   const store = readStore();
   const bucket = store[licenseId] || { results: [], logs: [] };

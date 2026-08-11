@@ -3,6 +3,7 @@ import { POST as prepareInquiry } from '@/app/api/inquiry/prepare/route';
 import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
 import { addInquiryLog, addInquiryResult, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError, setInquiryRunState } from '@/lib/inquiry-run-store';
 import { closeInquirySession } from '@/lib/inquiry-browser-store';
+import { cancelInquiryItemAttempt, finishInquiryItemAttempt, formatAttemptStep, isActiveInquiryItemAttempt, startInquiryItemAttempt, transitionInquiryItemState, type InquiryAttemptRef } from '@/lib/inquiry-item-lifecycle';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -52,6 +53,7 @@ async function withTargetWatchdog<T>(args: {
   phase: 'prepare' | 'submit';
   timeoutMs: number;
   task: Promise<T>;
+  attempt: InquiryAttemptRef;
 }): Promise<T> {
   const startedAt = Date.now();
   let finished = false;
@@ -65,13 +67,18 @@ async function withTargetWatchdog<T>(args: {
       licenseId: args.licenseId,
       runId: args.runId,
       level: 'info',
-      message: `${args.index + 1}/${args.total} — still ${args.phase === 'prepare' ? 'scanning' : 'submitting'} ${args.target} (${elapsed}s)`,
+      message: formatAttemptStep(`${args.index + 1}/${args.total} — still ${args.phase === 'prepare' ? 'scanning' : 'submitting'} ${args.target} (${elapsed}s)`, args.attempt),
+      attemptId: args.attempt.attemptId,
+      sessionGeneration: args.attempt.sessionGeneration,
+      targetIndex: args.attempt.index,
+      target: args.target,
     });
   }, 20_000);
 
   let timeoutHandle: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(async () => {
+      cancelInquiryItemAttempt(args.attempt, 'TIMEOUT', `${args.phase}_timeout_${Math.round(args.timeoutMs / 1000)}s`);
       try {
         // Closing the licensed Playwright session aborts any navigation/evaluate
         // that is actually wedged. The next target will recreate the same
@@ -104,12 +111,45 @@ export function startInquiryBackendWorker(args: {
 
   const task = (async () => {
     try {
+      let sessionGeneration = 1;
       for (let i = Math.max(0, args.startIndex); i < args.targets.length; i += 1) {
         await inquiryCheckpoint(args.licenseId);
         const state = getInquiryRunState(args.licenseId);
         if (state.runId && state.runId !== args.runId) return;
 
         const target = args.targets[i];
+        const attempt = startInquiryItemAttempt({
+          licenseId: args.licenseId,
+          runId: args.runId,
+          target,
+          index: i,
+          sessionGeneration,
+        });
+        const addAttemptLog = (level: 'info' | 'success' | 'warning' | 'error', message: string) => {
+          addInquiryLog({
+            licenseId: args.licenseId,
+            runId: args.runId,
+            level,
+            message: formatAttemptStep(message, attempt),
+            attemptId: attempt.attemptId,
+            sessionGeneration: attempt.sessionGeneration,
+            targetIndex: attempt.index,
+            target,
+          });
+        };
+        const addAttemptResult = (input: Omit<Parameters<typeof addInquiryResult>[0], 'licenseId' | 'runId' | 'sessionId' | 'target'> & { status: 'submitted' | 'failed' | 'captcha' | 'review'; reason?: string; contactUrl?: string }) => {
+          if (!isActiveInquiryItemAttempt(attempt)) return null;
+          return addInquiryResult({
+            licenseId: args.licenseId,
+            runId: args.runId,
+            sessionId: args.sessionId,
+            target,
+            ...input,
+            attemptId: attempt.attemptId,
+            sessionGeneration: attempt.sessionGeneration,
+            targetIndex: i,
+          });
+        };
         // Publish the active target before emitting its runtime log. The dashboard
         // uses this state to bind the screenshot stream to the same target/index,
         // avoiding logs visually advancing ahead of the browser preview.
@@ -121,7 +161,7 @@ export function startInquiryBackendWorker(args: {
           index: i,
           currentTarget: target,
         });
-        addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — checking ${target} for a contact form` });
+        addAttemptLog('info', `${i + 1}/${args.targets.length} — checking ${target} for a contact form`);
 
         let prepareResponse: Response;
         try {
@@ -134,53 +174,58 @@ export function startInquiryBackendWorker(args: {
             total: args.targets.length,
             phase: 'prepare',
             timeoutMs: 75_000,
+            attempt,
             task: prepareInquiry(requestFor(args.licenseId, '/api/inquiry/prepare', {
               sessionId: args.sessionId,
               runId: args.runId,
               target,
               profile: args.profile,
+              attemptId: attempt.attemptId,
+              sessionGeneration: attempt.sessionGeneration,
+              targetIndex: i,
             })),
           });
         } catch (error) {
           assertWorkerActive(args.licenseId, args.runId);
           if (error instanceof InquiryTargetTimeoutError) {
             const reason = `TARGET_TIMEOUT_${Math.round(error.timeoutMs / 1000)}S`;
-            addInquiryResult({
-              licenseId: args.licenseId,
-              runId: args.runId,
-              sessionId: args.sessionId,
-              status: 'failed',
-              target,
-              reason,
-            });
-            addInquiryLog({
-              licenseId: args.licenseId,
-              runId: args.runId,
-              level: 'warning',
-              message: `${i + 1}/${args.targets.length} — ${target} — scan timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically`,
-            });
+            transitionInquiryItemState(attempt, 'TIMEOUT');
+            addAttemptResult({ status: 'failed', reason });
+            addAttemptLog('warning', `${i + 1}/${args.targets.length} — ${target} — scan timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically`);
+            finishInquiryItemAttempt(attempt, 'TIMEOUT', reason);
+            sessionGeneration += 1;
             continue;
           }
+          cancelInquiryItemAttempt(attempt, 'FAILED', 'prepare_exception');
           throw error;
         }
         assertWorkerActive(args.licenseId, args.runId);
+        if (!isActiveInquiryItemAttempt(attempt)) continue;
         const prepared = await responseJson(prepareResponse);
         assertWorkerActive(args.licenseId, args.runId);
+        if (!isActiveInquiryItemAttempt(attempt)) continue;
 
         if (prepareResponse.ok && prepared?.success) {
           const classification = String(prepared.classification || (prepared.captchaDetected ? 'captcha' : 'form_found'));
           if (classification === 'captcha') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; saved and skipped automatically` });
+            addAttemptLog('warning', `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; saved and skipped automatically`);
+            finishInquiryItemAttempt(attempt, 'SKIPPED', 'captcha_detected');
           } else if (classification === 'review_required') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${prepared.contactUrl || target} — ${prepared.reviewReason || 'manual interaction needed'}; saved and skipped automatically` });
+            addAttemptLog('warning', `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${prepared.contactUrl || target} — ${prepared.reviewReason || 'manual interaction needed'}; saved and skipped automatically`);
+            finishInquiryItemAttempt(attempt, 'REVIEW_REQUIRED', 'prepare_review_required');
           } else if (classification === 'site_unavailable') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — ${target} — website unavailable (${prepared.unavailableReason || 'SITE_UNAVAILABLE'}); skipped automatically` });
+            addAttemptLog('warning', `${i + 1}/${args.targets.length} — ${target} — website unavailable (${prepared.unavailableReason || 'SITE_UNAVAILABLE'}); skipped automatically`);
+            finishInquiryItemAttempt(attempt, 'SKIPPED', 'site_unavailable');
           } else if (classification === 'no_form') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — ${target} — no usable contact/quote/inquiry form found; skipped automatically` });
+            addAttemptLog('warning', `${i + 1}/${args.targets.length} — ${target} — no usable contact/quote/inquiry form found; skipped automatically`);
+            finishInquiryItemAttempt(attempt, 'SKIPPED', 'no_form');
           } else if (classification === 'form_found') {
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}` });
-            addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'info', message: `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}` });
+            transitionInquiryItemState(attempt, 'FORM_FOUND');
+            transitionInquiryItemState(attempt, 'READY_TO_SUBMIT');
+            addAttemptLog('success', `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}`);
+            addAttemptLog('info', `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}`);
             await inquiryCheckpoint(args.licenseId);
+            transitionInquiryItemState(attempt, 'SUBMITTING');
             let submitResponse: Response;
             try {
               submitResponse = await withTargetWatchdog({
@@ -192,49 +237,54 @@ export function startInquiryBackendWorker(args: {
                 total: args.targets.length,
                 phase: 'submit',
                 timeoutMs: 35_000,
+                attempt,
                 task: submitInquiry(requestFor(args.licenseId, '/api/inquiry/submit', {
                   sessionId: args.sessionId,
                   runId: args.runId,
+                  attemptId: attempt.attemptId,
+                  sessionGeneration: attempt.sessionGeneration,
+                  targetIndex: i,
                 })),
               });
             } catch (error) {
               assertWorkerActive(args.licenseId, args.runId);
               if (error instanceof InquiryTargetTimeoutError) {
                 const reason = `SUBMIT_TIMEOUT_${Math.round(error.timeoutMs / 1000)}S`;
-                addInquiryResult({
-                  licenseId: args.licenseId,
-                  runId: args.runId,
-                  sessionId: args.sessionId,
+                addAttemptResult({
                   status: 'review',
-                  target,
                   contactUrl: prepared.contactUrl || target,
                   reason: `Submission did not reach a reliable terminal state within ${Math.round(error.timeoutMs / 1000)} seconds.`,
                 });
-                addInquiryLog({
-                  licenseId: args.licenseId,
-                  runId: args.runId,
-                  level: 'warning',
-                  message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — submission timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically`,
-                });
+                addAttemptLog('warning', `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — submission timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically`);
+                finishInquiryItemAttempt(attempt, 'TIMEOUT', reason);
+                sessionGeneration += 1;
                 continue;
               }
+              cancelInquiryItemAttempt(attempt, 'FAILED', 'submit_exception');
               throw error;
             }
             assertWorkerActive(args.licenseId, args.runId);
+            if (!isActiveInquiryItemAttempt(attempt)) continue;
             const submitted = await responseJson(submitResponse);
             assertWorkerActive(args.licenseId, args.runId);
+            if (!isActiveInquiryItemAttempt(attempt)) continue;
             if (submitResponse.ok && submitted?.success) {
-              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `${i + 1}/${args.targets.length} — submission confirmed on ${submitted.currentUrl || prepared.contactUrl || target}${submitted.confirmation ? ` — ${submitted.confirmation}` : ''}` });
+              addAttemptLog('success', `${i + 1}/${args.targets.length} — submission confirmed on ${submitted.currentUrl || prepared.contactUrl || target}${submitted.confirmation ? ` — ${submitted.confirmation}` : ''}`);
+              finishInquiryItemAttempt(attempt, 'DONE', 'submitted');
             } else if (submitted?.captchaDetected) {
-              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; saved and skipped automatically` });
+              addAttemptLog('warning', `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; saved and skipped automatically`);
+              finishInquiryItemAttempt(attempt, 'SKIPPED', 'submit_captcha');
             } else if (submitted?.reviewRequired) {
-              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'warning', message: `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — ${submitted.reason || submitted.error || 'manual interaction needed'}; saved and skipped automatically` });
+              addAttemptLog('warning', `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — ${submitted.reason || submitted.error || 'manual interaction needed'}; saved and skipped automatically`);
+              finishInquiryItemAttempt(attempt, 'REVIEW_REQUIRED', submitted.reason || submitted.error || 'submit_review_required');
             } else {
-              addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'error', message: `${i + 1}/${args.targets.length} — ${target} — submit failed: ${submitted?.error || `HTTP ${submitResponse.status}`}` });
+              addAttemptLog('error', `${i + 1}/${args.targets.length} — ${target} — submit failed: ${submitted?.error || `HTTP ${submitResponse.status}`}`);
+              finishInquiryItemAttempt(attempt, 'FAILED', 'submit_failed');
             }
           }
         } else {
-          addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'error', message: `${i + 1}/${args.targets.length} — ${target} — prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}` });
+          addAttemptLog('error', `${i + 1}/${args.targets.length} — ${target} — prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`);
+          finishInquiryItemAttempt(attempt, 'FAILED', 'prepare_failed');
         }
 
         // Live-monitor guarantee: do not replace the terminal page immediately.

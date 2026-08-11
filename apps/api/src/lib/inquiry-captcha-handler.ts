@@ -140,6 +140,7 @@ export class InquiryCaptchaHandler {
         const scripts = Array.from(document.querySelectorAll('script')).map((s: any) => String(s.src || ''));
         const iframes = Array.from(document.querySelectorAll('iframe')).map((f: any) => String(f.src || ''));
         const allSrcs = [...scripts, ...iframes];
+        const joined = allSrcs.join(' ');
 
         const hostOf = (url: string): string => {
           try { return new URL(url).hostname; } catch { return ''; }
