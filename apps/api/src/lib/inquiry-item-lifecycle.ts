@@ -76,7 +76,7 @@ const attempts = globalStore.__threeDSuiteInquiryItemAttempts ?? new Map<string,
 if (!globalStore.__threeDSuiteInquiryItemAttempts) globalStore.__threeDSuiteInquiryItemAttempts = attempts;
 
 function keyOf(ref: Pick<InquiryAttemptRef, 'licenseId' | 'runId' | 'target' | 'index'>): string {
-  return `${ref.licenseId}::${ref.runId}::${ref.index}::${ref.target.toLowerCase()}`;
+  return `${ref.licenseId}::${ref.runId}::${ref.index}`;
 }
 
 function buildControllerBag() {

@@ -11,10 +11,16 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  clearInquiryRunContext,
+  createInquiryRunContext,
+  getActiveInquiryRunId,
+  getInquiryRunContext,
+  getInquiryRunDiagnostics,
   getInquiryRunState,
   inquiryCheckpoint,
   InquiryRunStoppedError,
   setInquiryRunState,
+  stopInquiryRunContext,
 } from '../inquiry-run-store';
 
 // Use unique license prefixes per test suite to avoid globalThis state pollution.
@@ -27,121 +33,96 @@ function licId(suffix: string) {
 describe('inquiry run isolation', () => {
   // ── A) start run after previous stopped run ───────────────────────────────
 
-  it('A) new run proceeds normally after previous run was stopped', async () => {
+  it('A) new run: first item passes run-context check', async () => {
     const licenseId = licId('a');
-    const runA = 'run-a-stopped';
     const runB = 'run-b-fresh';
 
-    // Previous run ends in stopped state.
-    setInquiryRunState(licenseId, 'stopped', { runId: runA });
-    expect(getInquiryRunState(licenseId).mode).toBe('stopped');
-
-    // New run starts — control route sets mode=running with new runId.
+    createInquiryRunContext(licenseId, runB);
     setInquiryRunState(licenseId, 'running', { runId: runB });
 
-    // The checkpoint for the new run must NOT throw.
     await expect(inquiryCheckpoint(licenseId, runB)).resolves.toBeUndefined();
-
-    // State should still be running.
     expect(getInquiryRunState(licenseId).mode).toBe('running');
     expect(getInquiryRunState(licenseId).runId).toBe(runB);
   });
 
-  // ── B) restored cache must not force stopped state ────────────────────────
+  // ── B) context survives until explicit terminal cleanup ───────────────────
 
-  it('B) restoring campaign data must not restore operational stop flag', () => {
+  it('B) context not cleaned until run end', async () => {
     const licenseId = licId('b');
-    const runId = 'run-b-cache';
+    const runId = 'run-b-active';
 
-    // Simulate server-side in-memory state after a previous stopped run.
-    setInquiryRunState(licenseId, 'stopped', { runId });
-
-    // "Restore" is simulated by calling setInquiryRunState with running + same
-    // or new runId, which is what the control route does when action=start.
-    const newRunId = 'run-b-cache-new';
-    setInquiryRunState(licenseId, 'running', { runId: newRunId });
-
-    // Runtime state is fresh — not stopped.
-    const state = getInquiryRunState(licenseId);
-    expect(state.mode).toBe('running');
-    expect(state.runId).toBe(newRunId);
-  });
-
-  // ── C) old run stop event must not cancel new run ─────────────────────────
-
-  it('C) stale stop from old runId does not abort new run checkpoint', async () => {
-    const licenseId = licId('c');
-    const oldRunId = 'run-c-old';
-    const newRunId = 'run-c-new';
-
-    // Old run was stopped (mode=stopped kept in global map).
-    setInquiryRunState(licenseId, 'stopped', { runId: oldRunId });
-
-    // New run is started — state is overwritten to running with new runId.
-    setInquiryRunState(licenseId, 'running', { runId: newRunId });
-
-    // New run's checkpoint with its own runId must pass.
-    await expect(inquiryCheckpoint(licenseId, newRunId)).resolves.toBeUndefined();
-
-    // Old run's stale checkpoint with old runId must throw stale_run_context
-    // (not stopped_by_user), because the mode is now running but runId differs.
-    const staleError = await inquiryCheckpoint(licenseId, oldRunId).then(
-      () => null,
-      (e) => e
-    );
-    expect(staleError).toBeInstanceOf(InquiryRunStoppedError);
-    expect((staleError as InquiryRunStoppedError).code).toBe('stale_run_context');
-  });
-
-  // ── D) explicit stop cancels the active run ───────────────────────────────
-
-  it('D) explicit stop for active run throws stopped_by_user', async () => {
-    const licenseId = licId('d');
-    const runId = 'run-d-active';
-
+    createInquiryRunContext(licenseId, runId);
     setInquiryRunState(licenseId, 'running', { runId });
 
-    // User explicitly stops the run.
+    expect(getInquiryRunContext(licenseId, runId)?.stopped).toBe(false);
+    await expect(inquiryCheckpoint(licenseId, runId)).resolves.toBeUndefined();
+
+    setInquiryRunState(licenseId, 'complete', { runId });
+    expect(getInquiryRunContext(licenseId, runId)).not.toBeNull();
+
+    clearInquiryRunContext(licenseId, runId);
+    expect(getInquiryRunContext(licenseId, runId)).toBeNull();
+  });
+
+  // ── C) explicit stop invalidates remaining items correctly ────────────────
+
+  it('C) explicit stop invalidates remaining items correctly', async () => {
+    const licenseId = licId('c');
+    const runId = 'run-c-active';
+
+    createInquiryRunContext(licenseId, runId);
+    setInquiryRunState(licenseId, 'running', { runId });
+    stopInquiryRunContext(licenseId, runId);
     setInquiryRunState(licenseId, 'stopped', { runId });
 
-    // Checkpoint for this run must now throw stopped_by_user.
     const err = await inquiryCheckpoint(licenseId, runId).then(
       () => null,
       (e) => e
     );
     expect(err).toBeInstanceOf(InquiryRunStoppedError);
     expect((err as InquiryRunStoppedError).code).toBe('stopped_by_user');
-    expect((err as InquiryRunStoppedError).message).toBe('Inquiry run stopped by user.');
   });
 
-  // ── E) reason code "stopped_by_user" only for explicit user stop ──────────
+  // ── D) rerun after completion creates fresh run context ───────────────────
 
-  it('E) stale_run_context does not report stopped_by_user', async () => {
+  it('D) rerun after completion creates new runId and works', async () => {
+    const licenseId = licId('d');
+    const runA = 'run-d-one';
+    const runB = 'run-d-two';
+
+    createInquiryRunContext(licenseId, runA);
+    setInquiryRunState(licenseId, 'complete', { runId: runA });
+    clearInquiryRunContext(licenseId, runA);
+
+    createInquiryRunContext(licenseId, runB);
+    setInquiryRunState(licenseId, 'running', { runId: runB });
+    await expect(inquiryCheckpoint(licenseId, runB)).resolves.toBeUndefined();
+    expect(getActiveInquiryRunId(licenseId)).toBe(runB);
+
+    const stale = await inquiryCheckpoint(licenseId, runA).then(
+      () => null,
+      (e) => e
+    );
+    expect(stale).toBeInstanceOf(InquiryRunStoppedError);
+    expect((stale as InquiryRunStoppedError).code).toBe('stale_run_context');
+  });
+
+  // ── E) cache restore must not overwrite runtime context ───────────────────
+
+  it('E) restored local session state does not overwrite active runtime context', async () => {
     const licenseId = licId('e');
     const activeRunId = 'run-e-active';
-    const staleRunId = 'run-e-stale';
+    const staleRunId = 'run-e-restored';
 
-    // New run is active.
+    createInquiryRunContext(licenseId, activeRunId);
     setInquiryRunState(licenseId, 'running', { runId: activeRunId });
 
-    // Stale callback from old run calls checkpoint with the old runId.
-    const staleErr = await inquiryCheckpoint(licenseId, staleRunId).then(
-      () => null,
-      (e) => e
-    );
-    expect(staleErr).toBeInstanceOf(InquiryRunStoppedError);
-    expect((staleErr as InquiryRunStoppedError).code).toBe('stale_run_context');
-    // Message must NOT say "stopped by user".
-    expect((staleErr as InquiryRunStoppedError).message).not.toContain('stopped by user');
+    setInquiryRunState(licenseId, 'running', { runId: staleRunId });
 
-    // Only a genuine stop + same runId should yield stopped_by_user.
-    setInquiryRunState(licenseId, 'stopped', { runId: activeRunId });
-    const userStopErr = await inquiryCheckpoint(licenseId, activeRunId).then(
-      () => null,
-      (e) => e
-    );
-    expect(userStopErr).toBeInstanceOf(InquiryRunStoppedError);
-    expect((userStopErr as InquiryRunStoppedError).code).toBe('stopped_by_user');
-    expect((userStopErr as InquiryRunStoppedError).message).toBe('Inquiry run stopped by user.');
+    const diagnostics = getInquiryRunDiagnostics(licenseId, activeRunId);
+    expect(diagnostics.activeRunId).toBe(activeRunId);
+    expect(diagnostics.contextExists).toBe(true);
+    expect(diagnostics.stopped).toBe(false);
+    await expect(inquiryCheckpoint(licenseId, activeRunId)).resolves.toBeUndefined();
   });
 });

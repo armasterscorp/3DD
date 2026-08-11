@@ -417,7 +417,7 @@ export async function POST(request: NextRequest) {
     const throwIfStale = () => {
       if (!isAttemptActive()) throw new InquiryRunStoppedError('stale_run_context');
     };
-    await inquiryCheckpoint(licenseId);
+    await inquiryCheckpoint(licenseId, runId);
 
     const page = session.page;
     const steps: string[] = [];
@@ -507,7 +507,7 @@ export async function POST(request: NextRequest) {
     // visible form actions automatically, but stop on CAPTCHA or if the form
     // cannot present another valid action.
     for (let step = 0; step < 6; step += 1) {
-      await inquiryCheckpoint(licenseId);
+      await inquiryCheckpoint(licenseId, runId);
       throwIfStale();
       const chosen = await findBestForm(page);
       if (!chosen) {
@@ -564,7 +564,7 @@ export async function POST(request: NextRequest) {
       const beforeText = String(await page.locator('body').innerText().catch(() => ''));
       const beforeFillState = await getFormFillState(chosen);
 
-      await inquiryCheckpoint(licenseId);
+      await inquiryCheckpoint(licenseId, runId);
       throwIfStale();
       await submit.scrollIntoViewIfNeeded().catch(() => undefined);
       await visualSubmitPause(page, 500);
@@ -588,7 +588,7 @@ export async function POST(request: NextRequest) {
       // Keep the clicked state visible long enough for the live screenshot feed
       // to show the action, while submission confirmation itself remains adaptive.
       await visualSubmitPause(page, 700);
-      await inquiryCheckpoint(licenseId);
+      await inquiryCheckpoint(licenseId, runId);
       throwIfStale();
 
       const isIntermediate = /\b(next|continue|review|preview|suivant|continuer|poursuivre|reviser|aperçu|apercu)\b/i.test(label) && !/\b(send|submit|finish|complete|request|apply|envoyer|soumettre|terminer|finaliser)\b/i.test(label);

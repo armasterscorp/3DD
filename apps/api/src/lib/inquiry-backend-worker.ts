@@ -4,6 +4,9 @@ import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
 import {
   addInquiryLog,
   addInquiryResult,
+  clearInquiryRunContext,
+  getActiveInquiryRunId,
+  getInquiryRunDiagnostics,
   getInquiryRunState,
   inquiryCheckpoint,
   InquiryRunStoppedError,
@@ -28,14 +31,9 @@ import {
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
-  __threeDSuiteInquiryActiveRunIds?: Map<string, string>;
 };
 const workers = globalWorkers.__threeDSuiteInquiryWorkers ?? new Map<string, Promise<void>>();
 if (!globalWorkers.__threeDSuiteInquiryWorkers) globalWorkers.__threeDSuiteInquiryWorkers = workers;
-// Per-license active runId: prevents starting the same run twice while still
-// allowing a new run to start even if an old-run promise is still draining.
-const activeRunIds = globalWorkers.__threeDSuiteInquiryActiveRunIds ?? new Map<string, string>();
-if (!globalWorkers.__threeDSuiteInquiryActiveRunIds) globalWorkers.__threeDSuiteInquiryActiveRunIds = activeRunIds;
 
 const INQUIRY_SCAN_TIMEOUT_MS = 75_000;
 const INQUIRY_SUBMIT_TIMEOUT_MS = 35_000;
@@ -56,9 +54,20 @@ async function responseJson(response: Response): Promise<any> {
 }
 
 function assertWorkerActive(licenseId: string, runId: string): void {
+  const diagnostics = getInquiryRunDiagnostics(licenseId, runId);
   const state = getInquiryRunState(licenseId);
-  if (state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
-  if (state.runId && state.runId !== runId) throw new InquiryRunStoppedError('stale_run_context');
+  if (diagnostics.stopped || state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
+  if (!diagnostics.isActive) throw new InquiryRunStoppedError('stale_run_context');
+}
+
+class InquiryRunContextError extends Error {
+  constructor(
+    message: string,
+    public readonly diagnostics: ReturnType<typeof getInquiryRunDiagnostics>
+  ) {
+    super(message);
+    this.name = 'InquiryRunContextError';
+  }
 }
 
 class InquiryTargetTimeoutError extends Error {
@@ -181,8 +190,6 @@ function canonicalTerminalMessage(args: {
       return `${prefix} — [scan_timeout] scan timed out; browser session recycled and skipped automatically`;
     case 'submit_timeout':
       return `${prefix} — [submit_timeout] submission timed out; browser session recycled and saved for review`;
-    case 'run_context_invalid':
-      return `${prefix} — [run_context_invalid] ${args.detail || 'run context is no longer active; skipped automatically'}`;
     case 'submit_failed':
     default:
       return `${prefix} — [submit_failed] ${args.detail || 'submission/prepare failed'}`;
@@ -197,22 +204,53 @@ export function startInquiryBackendWorker(args: {
   startIndex: number;
   profile: Record<string, unknown>;
 }): void {
-  // Prevent starting the same runId twice (idempotent call guard).
-  // A different runId for the same license is always allowed; the old worker
-  // will detect the mismatch on its next checkpoint and exit cleanly.
-  if (activeRunIds.get(args.licenseId) === args.runId) return;
-  activeRunIds.set(args.licenseId, args.runId);
+  // Prevent starting the same run twice.
+  if (workers.has(`${args.licenseId}:${args.runId}`)) return;
   console.info(`[inquiry-worker] runId=${args.runId} licenseId=${args.licenseId} isStopped=false controllers=created starting ${args.targets.length} targets`);
 
   const key = `${args.licenseId}:${args.runId}`;
 
   const task = (async () => {
+    const summary = { processed: 0, success: 0, skippedReview: 0, failed: 0 };
+    const summaryText = () =>
+      `${summary.processed}/${args.targets.length} processed (success ${summary.success}, skipped/review ${summary.skippedReview}, failed ${summary.failed})`;
+    const trackTerminal = (terminalState: InquiryTerminalState) => {
+      summary.processed += 1;
+      if (terminalState === 'SUBMITTED') summary.success += 1;
+      else if (
+        terminalState === 'SKIPPED_NO_FORM' ||
+        terminalState === 'SKIPPED_CAPTCHA_REQUIRED' ||
+        terminalState === 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED' ||
+        terminalState === 'TIMEOUT_SUBMIT'
+      ) {
+        summary.skippedReview += 1;
+      } else {
+        summary.failed += 1;
+      }
+    };
+    const logRunContextDebug = (label: 'run_start' | 'item_1') => {
+      const diagnostics = getInquiryRunDiagnostics(args.licenseId, args.runId);
+      addInquiryLog({
+        licenseId: args.licenseId,
+        runId: args.runId,
+        level: 'info',
+        message: `[debug] ${label} run-context — runId=${args.runId} activeRunId=${getActiveInquiryRunId(args.licenseId) || 'none'} contextExists=${diagnostics.contextExists} stopped=${diagnostics.stopped}`,
+      });
+      if (!diagnostics.isActive) {
+        throw new InquiryRunContextError(
+          `Inactive inquiry run context at ${label}.`,
+          diagnostics
+        );
+      }
+    };
     try {
+      logRunContextDebug('run_start');
       let sessionGeneration = 1;
       for (let i = Math.max(0, args.startIndex); i < args.targets.length; i += 1) {
         await inquiryCheckpoint(args.licenseId, args.runId);
         const state = getInquiryRunState(args.licenseId);
         if (state.runId && state.runId !== args.runId) return;
+        if (i === Math.max(0, args.startIndex)) logRunContextDebug('item_1');
 
         const target = args.targets[i];
         const attempt = startInquiryItemAttempt({
@@ -263,6 +301,7 @@ export function startInquiryBackendWorker(args: {
               targetIndex: i,
             });
           }
+          trackTerminal(input.terminalState);
           addInquiryLog({
             licenseId: args.licenseId,
             runId: args.runId,
@@ -342,15 +381,17 @@ export function startInquiryBackendWorker(args: {
         if (!isActiveInquiryItemAttempt(attempt)) continue;
 
         if (!(prepareResponse.ok && prepared?.success)) {
-          const runContextInvalid = prepared?.code === 'RUN_STOPPED';
-          if (runContextInvalid) assertWorkerActive(args.licenseId, args.runId);
+          if (prepared?.code === 'RUN_STOPPED') {
+            throw new InquiryRunContextError(
+              prepared?.error || 'Inquiry run context is no longer active.',
+              getInquiryRunDiagnostics(args.licenseId, args.runId)
+            );
+          }
           emitTerminal({
             terminalState: 'FAILED',
-            reasonCode: runContextInvalid ? 'run_context_invalid' : 'submit_failed',
-            level: runContextInvalid ? 'warning' : 'error',
-            detail: runContextInvalid
-              ? prepared?.error || 'Inquiry run context is no longer active.'
-              : `prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`,
+            reasonCode: 'submit_failed',
+            level: 'error',
+            detail: `prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`,
           });
           continue;
         }
@@ -475,15 +516,17 @@ export function startInquiryBackendWorker(args: {
               contactUrl: prepared.contactUrl || target,
             });
           } else {
-            const runContextInvalid = submitted?.code === 'RUN_STOPPED';
-            if (runContextInvalid) assertWorkerActive(args.licenseId, args.runId);
+            if (submitted?.code === 'RUN_STOPPED') {
+              throw new InquiryRunContextError(
+                submitted?.error || 'Inquiry run context is no longer active.',
+                getInquiryRunDiagnostics(args.licenseId, args.runId)
+              );
+            }
             emitTerminal({
               terminalState: 'FAILED',
-              reasonCode: runContextInvalid ? 'run_context_invalid' : 'submit_failed',
-              level: runContextInvalid ? 'warning' : 'error',
-              detail: runContextInvalid
-                ? submitted?.error || 'Inquiry run context is no longer active.'
-                : submitted?.error || `HTTP ${submitResponse.status}`,
+              reasonCode: 'submit_failed',
+              level: 'error',
+              detail: submitted?.error || `HTTP ${submitResponse.status}`,
               contactUrl: prepared.contactUrl || target,
             });
           }
@@ -511,7 +554,7 @@ export function startInquiryBackendWorker(args: {
         licenseId: args.licenseId,
         runId: args.runId,
         level: 'success',
-        message: `Inquiry automatic run complete — ${args.targets.length}/${args.targets.length} processed`,
+        message: `Inquiry automatic run complete — ${summaryText()}`,
       });
       setInquiryRunState(args.licenseId, 'complete', {
         runId: args.runId,
@@ -523,6 +566,24 @@ export function startInquiryBackendWorker(args: {
       });
     } catch (error) {
       const current = getInquiryRunState(args.licenseId);
+      if (error instanceof InquiryRunContextError) {
+        setInquiryRunState(args.licenseId, 'stopped', {
+          runId: args.runId,
+          sessionId: args.sessionId,
+          targets: args.targets,
+          totalTargets: args.targets.length,
+          index: current.index,
+          currentTarget: current.currentTarget,
+        });
+        addInquiryLog({
+          licenseId: args.licenseId,
+          runId: args.runId,
+          level: 'error',
+          message: `Inquiry automatic run aborted — ${summaryText()} — ${error.message} (runId=${error.diagnostics.runId} activeRunId=${error.diagnostics.activeRunId || 'none'} contextExists=${error.diagnostics.contextExists} stopped=${error.diagnostics.stopped})`,
+        });
+        console.error('[inquiry-worker] fatal run context error', error.message, error.diagnostics);
+        return;
+      }
       const isStaleRunContext = error instanceof InquiryRunStoppedError && error.code === 'stale_run_context';
       const explicitlyStopped =
         error instanceof InquiryRunStoppedError ||
@@ -531,6 +592,12 @@ export function startInquiryBackendWorker(args: {
       if (isStaleRunContext) {
         console.info(`[inquiry-worker] runId=${args.runId} source=system exited: stale_run_context (superseded by new run)`);
       } else if (explicitlyStopped) {
+        addInquiryLog({
+          licenseId: args.licenseId,
+          runId: args.runId,
+          level: 'warning',
+          message: `Inquiry automatic run stopped — ${summaryText()}`,
+        });
         console.info(`[inquiry-worker] runId=${args.runId} source=user stopped at ${new Date().toISOString()}`);
       } else {
         setInquiryRunState(args.licenseId, 'stopped', {
@@ -545,14 +612,15 @@ export function startInquiryBackendWorker(args: {
           licenseId: args.licenseId,
           runId: args.runId,
           level: 'error',
-          message: `Inquiry backend worker stopped with error — ${
+          message: `Inquiry backend worker stopped with error — ${summaryText()} — ${
             error instanceof Error ? error.message : String(error)
           }`,
         });
         console.error('[inquiry-worker]', error);
       }
-      await closeInquirySession(args.sessionId, args.licenseId).catch(() => undefined);
     } finally {
+      await closeInquirySession(args.sessionId, args.licenseId).catch(() => undefined);
+      clearInquiryRunContext(args.licenseId, args.runId);
       workers.delete(key);
     }
   })();

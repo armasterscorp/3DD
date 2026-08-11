@@ -38,12 +38,27 @@ type LicenseBucket = { results: InquiryStoredResult[]; logs?: InquiryStoredLog[]
 type PersistentStore = Record<string, LicenseBucket>;
 export type InquiryRunState = { mode: RunMode; sessionId?: string; runId?: string; targets?: string[]; totalTargets?: number; index?: number; currentTarget?: string; updatedAt: string };
 type RunState = InquiryRunState;
+export type InquiryRuntimeContext = {
+  licenseId: string;
+  runId: string;
+  stopped: boolean;
+  createdAt: string;
+  stopRequestedAt?: string;
+};
 
 const globalStore = globalThis as typeof globalThis & {
   __threeDSuiteInquiryRunStates?: Map<string, RunState>;
 };
 const runStates = globalStore.__threeDSuiteInquiryRunStates ?? new Map<string, RunState>();
 if (!globalStore.__threeDSuiteInquiryRunStates) globalStore.__threeDSuiteInquiryRunStates = runStates;
+const globalRuntimeStore = globalThis as typeof globalThis & {
+  __threeDSuiteInquiryRuntimeContexts?: Map<string, InquiryRuntimeContext>;
+  __threeDSuiteInquiryActiveRunIds?: Map<string, string>;
+};
+const runtimeContexts = globalRuntimeStore.__threeDSuiteInquiryRuntimeContexts ?? new Map<string, InquiryRuntimeContext>();
+const activeRunIds = globalRuntimeStore.__threeDSuiteInquiryActiveRunIds ?? new Map<string, string>();
+if (!globalRuntimeStore.__threeDSuiteInquiryRuntimeContexts) globalRuntimeStore.__threeDSuiteInquiryRuntimeContexts = runtimeContexts;
+if (!globalRuntimeStore.__threeDSuiteInquiryActiveRunIds) globalRuntimeStore.__threeDSuiteInquiryActiveRunIds = activeRunIds;
 
 const dataDir = path.join(process.cwd(), '.3dsuite-data');
 const dataFile = path.join(dataDir, 'inquiry-results.json');
@@ -73,6 +88,13 @@ function writeStore(store: PersistentStore): void {
   fs.writeFileSync(dataFile, JSON.stringify(store, null, 2), 'utf8');
 }
 
+function runtimeKey(licenseIdValue: string, runIdValue: string): string {
+  const licenseId = safeLicenseId(licenseIdValue);
+  const runId = String(runIdValue || '').trim();
+  if (!runId) throw new Error('Missing Inquiry run id.');
+  return `${licenseId}::${runId}`;
+}
+
 export function setInquiryRunState(licenseIdValue: string, mode: RunMode, details: { sessionId?: string; runId?: string; targets?: string[]; totalTargets?: number; index?: number; currentTarget?: string } = {}): RunState {
   const licenseId = safeLicenseId(licenseIdValue);
   const previous = runStates.get(licenseId);
@@ -95,6 +117,76 @@ export function getInquiryRunState(licenseIdValue: string): RunState {
   return runStates.get(licenseId) || { mode: 'idle', updatedAt: new Date().toISOString() };
 }
 
+export function createInquiryRunContext(licenseIdValue: string, runIdValue: string): InquiryRuntimeContext {
+  const licenseId = safeLicenseId(licenseIdValue);
+  const runId = String(runIdValue || '').trim();
+  if (!runId) throw new Error('Missing Inquiry run id.');
+  const context: InquiryRuntimeContext = {
+    licenseId,
+    runId,
+    stopped: false,
+    createdAt: new Date().toISOString(),
+  };
+  activeRunIds.set(licenseId, runId);
+  runtimeContexts.set(runtimeKey(licenseId, runId), context);
+  return context;
+}
+
+export function getInquiryRunContext(licenseIdValue: string, runIdValue: string): InquiryRuntimeContext | null {
+  const licenseId = safeLicenseId(licenseIdValue);
+  const runId = String(runIdValue || '').trim();
+  if (!runId) return null;
+  return runtimeContexts.get(runtimeKey(licenseId, runId)) || null;
+}
+
+export function getActiveInquiryRunId(licenseIdValue: string): string | undefined {
+  const licenseId = safeLicenseId(licenseIdValue);
+  return activeRunIds.get(licenseId);
+}
+
+export function stopInquiryRunContext(licenseIdValue: string, runIdValue?: string): boolean {
+  const licenseId = safeLicenseId(licenseIdValue);
+  const runId = String(runIdValue || activeRunIds.get(licenseId) || '').trim();
+  if (!runId) return false;
+  const context = runtimeContexts.get(runtimeKey(licenseId, runId));
+  if (!context) return false;
+  context.stopped = true;
+  context.stopRequestedAt = new Date().toISOString();
+  return true;
+}
+
+export function clearInquiryRunContext(licenseIdValue: string, runIdValue: string): void {
+  const licenseId = safeLicenseId(licenseIdValue);
+  const runId = String(runIdValue || '').trim();
+  if (!runId) return;
+  runtimeContexts.delete(runtimeKey(licenseId, runId));
+  if (activeRunIds.get(licenseId) === runId) activeRunIds.delete(licenseId);
+}
+
+export function getInquiryRunDiagnostics(licenseIdValue: string, runIdValue: string): {
+  runId: string;
+  activeRunId?: string;
+  contextExists: boolean;
+  stopped: boolean;
+  isActive: boolean;
+} {
+  const licenseId = safeLicenseId(licenseIdValue);
+  const runId = String(runIdValue || '').trim();
+  const activeRunId = activeRunIds.get(licenseId);
+  const context = runId ? runtimeContexts.get(runtimeKey(licenseId, runId)) : undefined;
+  return {
+    runId,
+    activeRunId,
+    contextExists: !!context,
+    stopped: !!context?.stopped,
+    isActive: !!runId && activeRunId === runId && !!context && !context.stopped,
+  };
+}
+
+export function isInquiryRunActive(licenseIdValue: string, runIdValue: string): boolean {
+  return getInquiryRunDiagnostics(licenseIdValue, runIdValue).isActive;
+}
+
 export class InquiryRunStoppedError extends Error {
   public readonly code: 'stopped_by_user' | 'stale_run_context';
   constructor(code: 'stopped_by_user' | 'stale_run_context' = 'stopped_by_user') {
@@ -114,9 +206,12 @@ export async function inquiryCheckpoint(licenseIdValue: string, expectedRunId?: 
   const licenseId = safeLicenseId(licenseIdValue);
   for (;;) {
     const state = getInquiryRunState(licenseId);
-    if (state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
-    if (expectedRunId && state.runId && state.runId !== expectedRunId) {
-      throw new InquiryRunStoppedError('stale_run_context');
+    if (expectedRunId) {
+      const diagnostics = getInquiryRunDiagnostics(licenseId, expectedRunId);
+      if (diagnostics.stopped || state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
+      if (!diagnostics.isActive) throw new InquiryRunStoppedError('stale_run_context');
+    } else {
+      if (state.mode === 'stopped') throw new InquiryRunStoppedError('stopped_by_user');
     }
     if (state.mode !== 'paused') return;
     await new Promise((resolve) => setTimeout(resolve, 250));
