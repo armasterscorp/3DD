@@ -17,6 +17,7 @@ export type CaptchaPrimaryReason =
 export type InquiryPrimaryReason =
   | CaptchaPrimaryReason
   | 'no_form_found'
+  | 'review_required_unchecked_required_checkbox'
   | 'scan_timeout'
   | 'submit_timeout'
   | 'submit_failed'

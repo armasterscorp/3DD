@@ -19,6 +19,7 @@ import {
   markCaptchaSolved,
   shouldAttemptPreSubmitCaptchaSolve,
 } from '@/lib/inquiry-submit-captcha-policy';
+import { ensureConsentCheckboxes } from '@/lib/inquiry-consent-checkboxes';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -79,32 +80,6 @@ async function findSubmitControl(form: any): Promise<any | null> {
 }
 
 
-
-async function checkRequiredPrivacyConsents(scope: any): Promise<number> {
-  const boxes = scope.locator('input[type="checkbox"]');
-  const count = await boxes.count().catch(() => 0);
-  let checked = 0;
-  const consentPattern = /\b(consent|agree|agreement|privacy|data processing|processing of (?:my|the) data|collection.*data|storage.*data|terms and conditions|terms of use|accept|acknowledge|gdpr|personal data|confidentiality|j accepte|je consens|consentement|politique de confidentialité|politique de confidentialite|traitement des données|traitement des donnees|données personnelles|donnees personnelles)\b/i;
-  const marketingPattern = /\b(newsletter|marketing|promotional|promotions|offers|special offers|email updates|subscribe|subscription|sms updates|text messages|advertising|commercial messages)\b/i;
-  for (let i = 0; i < count; i += 1) {
-    const box = boxes.nth(i);
-    if (!(await box.isVisible().catch(() => false)) || !(await box.isEnabled().catch(() => false))) continue;
-    if (await box.isChecked().catch(() => false)) continue;
-    const text = String(await box.evaluate((el: any) => {
-      const label = el.closest('label');
-      const parent = el.parentElement;
-      let explicit = '';
-      if (el.id) explicit = document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent || '';
-      return [explicit, label?.innerText || '', parent?.innerText || '', el.getAttribute('aria-label') || '', el.getAttribute('name') || ''].join(' ');
-    }).catch(() => ''));
-    const required = (await box.getAttribute('required').catch(() => null)) !== null || (await box.getAttribute('aria-required').catch(() => '')) === 'true';
-    if ((required || consentPattern.test(text)) && consentPattern.test(text) && !marketingPattern.test(text)) {
-      await box.check({ force: true }).catch(async () => { await box.click({ force: true }).catch(() => undefined); });
-      if (await box.isChecked().catch(() => false)) checked += 1;
-    }
-  }
-  return checked;
-}
 
 async function countVisibleInvalidRequired(form: any): Promise<number> {
   const fields = form.locator('input, textarea, select');
@@ -436,7 +411,7 @@ export async function POST(request: NextRequest) {
       if (attemptRef) markInquiryItemCaptchaDetected(attemptRef, provider);
     };
 
-    const saveReview = (reason: string, failureDetail = reason, provider?: string) => {
+    const saveReview = (reason: string, failureDetail = reason, provider?: string, primaryReasonOverride?: string) => {
       const primaryReason = mapCaptchaTerminalReason({
         captchaDetected: captchaState.captchaDetected,
         captchaClassificationLocked: captchaState.captchaClassificationLocked,
@@ -450,7 +425,7 @@ export async function POST(request: NextRequest) {
         status: primaryReason ? 'captcha' : 'review',
         contactUrl: page.url(),
         reason,
-        primaryReason: primaryReason || 'submit_failed',
+        primaryReason: primaryReason || primaryReasonOverride || 'submit_failed',
         failureDetail,
         captchaDetected: primaryReason ? true : undefined,
         captchaType: provider || captchaState.captchaType,
@@ -464,7 +439,7 @@ export async function POST(request: NextRequest) {
         captchaClassificationLocked: !!primaryReason,
         captchaProvider: primaryReason ? (provider || captchaState.captchaType || 'CAPTCHA') : undefined,
         captchaType: primaryReason ? (provider || captchaState.captchaType || 'CAPTCHA') : undefined,
-        primaryReason: primaryReason || 'submit_failed',
+        primaryReason: primaryReason || primaryReasonOverride || 'submit_failed',
         failureDetail,
         reason,
         error: reason,
@@ -586,10 +561,33 @@ export async function POST(request: NextRequest) {
         return saveReview('The form needs manual review because no usable contact/quote form is currently visible after an intermediate step.');
       }
 
-      await checkRequiredPrivacyConsents(chosen);
-
       const overlayState = await handleBlockingOverlays(page);
       if (overlayState.reviewRequired) return saveReview(overlayState.reviewRequired);
+
+      const checkboxSummary = await ensureConsentCheckboxes(chosen, {
+        debugLog: (message) => log('info', message),
+      });
+      log(
+        'info',
+        `checkboxes_found=${checkboxSummary.checkboxesFound} required_checked_count=${checkboxSummary.requiredCheckedCount} optional_checked_count=${checkboxSummary.optionalCheckedCount} unchecked_required_remaining=${checkboxSummary.uncheckedRequiredRemaining}`
+      );
+      if (checkboxSummary.uncheckedRequiredRemaining > 0) {
+        const retrySummary = await ensureConsentCheckboxes(chosen, {
+          debugLog: (message) => log('info', message),
+        });
+        log(
+          'info',
+          `checkboxes_found=${retrySummary.checkboxesFound} required_checked_count=${retrySummary.requiredCheckedCount} optional_checked_count=${retrySummary.optionalCheckedCount} unchecked_required_remaining=${retrySummary.uncheckedRequiredRemaining}`
+        );
+        if (retrySummary.uncheckedRequiredRemaining > 0) {
+          return saveReview(
+            `Manual review required: ${retrySummary.uncheckedRequiredRemaining} required checkbox${retrySummary.uncheckedRequiredRemaining === 1 ? '' : 'es'} remain unchecked after two consent passes.`,
+            'review_required_unchecked_required_checkbox',
+            undefined,
+            'review_required_unchecked_required_checkbox'
+          );
+        }
+      }
 
       const captchaBeforeSubmit = await detectCaptcha(page, chosen);
       if (
