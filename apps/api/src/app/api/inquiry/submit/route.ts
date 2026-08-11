@@ -3,6 +3,7 @@ import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-
 import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
 import { getUserApiKey } from '@/lib/captcha-solver';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
+import { classifyCaptchaProviderFromText, classifyCaptchaProviderFromIframe, classifyCaptchaProviderFromError, UNKNOWN_CAPTCHA } from '@/lib/captcha-classifier';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -151,7 +152,7 @@ async function detectSubmissionOutcome(page: any, beforeUrl: string, beforeText:
 
     const captcha = await detectCaptcha(page, page.locator('body'));
     if (captcha.detected) {
-      return { status: 'captcha', reason: `CAPTCHA detected after the submit action (${captcha.provider || 'CAPTCHA'}).`, captchaProvider: captcha.provider || 'CAPTCHA' };
+      return { status: 'captcha', reason: `CAPTCHA detected after the submit action (${captcha.provider || 'Unknown CAPTCHA / Human Verification'}).`, captchaProvider: captcha.provider || 'Unknown CAPTCHA / Human Verification' };
     }
 
     // This catches normal inline confirmations plus transient toast/modal text
@@ -268,14 +269,8 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
 
   const challengeText = `${formText}\n${bodyText}`;
   if (/verify (?:that )?you are human|i am not a robot|security check|human verification|prove (?:that )?you are human|complete (?:the )?(?:security|human) check|press and hold|complete (?:the )?captcha|captcha (?:is )?required|captcha validation failed|please (?:complete|solve|verify).*captcha|please check .*captcha|verification required/i.test(challengeText)) {
-    return {
-      detected: true,
-      provider:
-        /hcaptcha/i.test(challengeText) ? 'hCaptcha' :
-        /cloudflare|turnstile/i.test(challengeText) ? 'Cloudflare Turnstile' :
-        /recaptcha/i.test(challengeText) ? 'reCAPTCHA' :
-        'CAPTCHA / human verification',
-    };
+    // Classify strictly by concrete provider signals; no default fallback to reCAPTCHA.
+    return { detected: true, provider: classifyCaptchaProviderFromText(challengeText) };
   }
 
   // Visible checkbox-style provider widget counts as a blocking CAPTCHA.
@@ -292,13 +287,8 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     const titleAttr = String(await frame.getAttribute('title').catch(() => '') || '');
 
     if (box.width >= 160 && box.height >= 45) {
-      return {
-        detected: true,
-        provider:
-          /hcaptcha/i.test(`${src} ${titleAttr}`) ? 'hCaptcha' :
-          /cloudflare|turnstile/i.test(`${src} ${titleAttr}`) ? 'Cloudflare Turnstile' :
-          'reCAPTCHA',
-      };
+      // Classify strictly by concrete iframe signals; no default fallback to reCAPTCHA.
+      return { detected: true, provider: classifyCaptchaProviderFromIframe(`${src} ${titleAttr}`) };
     }
   }
 
@@ -315,14 +305,7 @@ async function detectCaptcha(page: any, form: any): Promise<{ detected: boolean;
     const msg = String(await node.innerText().catch(() => '') || '').trim();
     if (!msg) continue;
     if (/captcha|recaptcha|hcaptcha|turnstile|human verification|verify (?:that )?you are human|verification required|security check/i.test(msg)) {
-      return {
-        detected: true,
-        provider:
-          /hcaptcha/i.test(msg) ? 'hCaptcha' :
-          /cloudflare|turnstile/i.test(msg) ? 'Cloudflare Turnstile' :
-          /recaptcha/i.test(msg) ? 'reCAPTCHA' :
-          'CAPTCHA / human verification',
-      };
+      return { detected: true, provider: classifyCaptchaProviderFromError(msg) };
     }
   }
 
@@ -354,32 +337,65 @@ export async function POST(request: NextRequest) {
     };
     const savedApiKey = getUserApiKey(licenseId);
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
-    const solveCaptchaWithTimeout = async (message: string) => {
-      if (!captchaHandler) return { status: 'unconfigured' as const };
-      addInquiryLog({ licenseId, runId, level: 'info', message });
+
+    /**
+     * Single-source-of-truth CAPTCHA state machine for a named submit stage.
+     *
+     * Detects once, logs once, attempts solve if solver is available.
+     * Never logs "no CAPTCHA detected" when detection was positive.
+     * Returns whether CAPTCHA was detected and whether it was resolved.
+     */
+    const checkAndHandleCaptchaBeforeSubmit = async (
+      stageLabel: string,
+      form: any
+    ): Promise<{ detected: boolean; provider: string; resolved: boolean }> => {
+      const pageUrl = page.url();
+      const captchaResult = await detectCaptcha(page, form);
+
+      if (!captchaResult.detected) return { detected: false, provider: '', resolved: false };
+
+      const provider = captchaResult.provider || 'Unknown CAPTCHA / Human Verification';
+
+      if (!captchaHandler) {
+        addInquiryLog({
+          licenseId, runId, level: 'info',
+          message: `CAPTCHA detected on ${stageLabel}: ${pageUrl} (${provider}) — solver not configured, auto-solve skipped`,
+        });
+        return { detected: true, provider, resolved: false };
+      }
+
+      addInquiryLog({
+        licenseId, runId, level: 'info',
+        message: `CAPTCHA detected on ${stageLabel}: ${pageUrl} (${provider}) — attempting automated solve`,
+      });
+
       try {
-        const result = await Promise.race([
+        const solveResult = await Promise.race([
           captchaHandler.handleCaptcha(page),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
             setTimeout(() => resolve({ handled: false, status: 'failed', error: 'timeout after 5 seconds' }), 5_000)
           ),
         ]);
-        if (result.status === 'solved') {
-          addInquiryLog({ licenseId, runId, level: 'success', message: '✓ CAPTCHA solved' });
-        } else if (result.status === 'not_found') {
-          addInquiryLog({ licenseId, runId, level: 'info', message: 'no CAPTCHA detected' });
-        } else if (result.status === 'failed') {
-          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+
+        if (solveResult.status === 'solved') {
+          addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA solved on ${stageLabel}: ${pageUrl} (${provider})` });
+          return { detected: true, provider, resolved: true };
         }
-        return result;
+
+        const disposeReason = solveResult.status === 'not_found'
+          ? 'automated solve found no solvable widget'
+          : `solve failed: ${(solveResult as any).error || 'unknown error'}`;
+        addInquiryLog({
+          licenseId, runId, level: 'warning',
+          message: `CAPTCHA unresolved on ${stageLabel}: ${pageUrl} (${provider}) — ${disposeReason}`,
+        });
+        return { detected: true, provider, resolved: false };
       } catch (error) {
         addInquiryLog({
-          licenseId,
-          runId,
-          level: 'warning',
-          message: `⚠ CAPTCHA solving failed, continuing anyway (${error instanceof Error ? error.message : String(error)})`,
+          licenseId, runId, level: 'warning',
+          message: `CAPTCHA unresolved on ${stageLabel}: ${pageUrl} (${provider}) — solve error: ${error instanceof Error ? error.message : String(error)}`,
         });
-        return { handled: false, status: 'failed' as const };
+        return { detected: true, provider, resolved: false };
       }
     };
 
@@ -388,7 +404,13 @@ export async function POST(request: NextRequest) {
     // cannot present another valid action.
     for (let step = 0; step < 6; step += 1) {
       await inquiryCheckpoint(licenseId);
-      const chosen = await findBestForm(page);
+      let chosen = await findBestForm(page);
+      if (!chosen) {
+        // After an intermediate click the page may still be rendering — give it
+        // one short grace period before concluding the form is gone.
+        await page.waitForTimeout(1200);
+        chosen = await findBestForm(page);
+      }
       if (!chosen) {
         // A disappeared form is not enough to claim success; the final outcome
         // still has to be confirmed below or the target is kept for review.
@@ -401,20 +423,19 @@ export async function POST(request: NextRequest) {
       const overlayState = await handleBlockingOverlays(page);
       if (overlayState.reviewRequired) return saveReview(overlayState.reviewRequired);
 
-      await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission');
-      const captcha = await detectCaptcha(page, chosen);
-      if (captcha.detected) {
-        addInquiryLog({
-          licenseId,
-          runId,
-          level: 'warning',
-          message: `⚠ CAPTCHA still detected (${captcha.provider || 'CAPTCHA'}), continuing submission attempt`,
-        });
+      // Re-discover form after overlay dismissal in case the DOM mutated.
+      const activeForm = await findBestForm(page) || chosen;
+      const captchaState = await checkAndHandleCaptchaBeforeSubmit('form submission', activeForm);
+      if (captchaState.detected && !captchaState.resolved) {
+        const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: captchaState.provider, reason: `CAPTCHA on form submission (${captchaState.provider}) could not be resolved automatically`, values: session.profile || {} });
+        return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: captchaState.provider, error: `CAPTCHA detected (${captchaState.provider}) — unresolved`, resultId: result.id, steps }, { status: 409 });
       }
 
-      const submit = await findSubmitControl(chosen);
+      // Re-acquire submit control after potential CAPTCHA solve / DOM mutations.
+      const submitForm = await findBestForm(page) || activeForm;
+      const submit = await findSubmitControl(submitForm);
       if (!submit) {
-        await chosen.evaluate((el: HTMLElement) => el.scrollIntoView({ block: 'center', inline: 'nearest' })).catch(() => undefined);
+        await submitForm.evaluate((el: HTMLElement) => el.scrollIntoView({ block: 'center', inline: 'nearest' })).catch(() => undefined);
         return saveReview('Manual review required: no recognizable Send / Submit / Next / Continue action was found.');
       }
 
@@ -428,7 +449,7 @@ export async function POST(request: NextRequest) {
 
       const beforeUrl = String(page.url?.() || '');
       const beforeText = String(await page.locator('body').innerText().catch(() => ''));
-      const beforeFillState = await getFormFillState(chosen);
+      const beforeFillState = await getFormFillState(submitForm);
 
       await inquiryCheckpoint(licenseId);
       await submit.scrollIntoViewIfNeeded().catch(() => undefined);
@@ -440,8 +461,10 @@ export async function POST(request: NextRequest) {
         if (/intercepts pointer events|not visible|not enabled|timeout/i.test(message)) {
           const overlayRetry = await handleBlockingOverlays(page);
           if (overlayRetry.reviewRequired) return saveReview(overlayRetry.reviewRequired);
+          // Re-acquire submit after overlay dismissal before the final retry click.
+          const submitAfterOverlay = await findSubmitControl(await findBestForm(page) || submitForm) || submit;
           try {
-            await submit.click({ timeout: 3500 });
+            await submitAfterOverlay.click({ timeout: 3500 });
           } catch (retryError) {
             const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
             return saveReview(`Manual review required: the final action is blocked by another page element (${retryMessage.split('\n')[0].slice(0, 180)}).`);
@@ -461,7 +484,8 @@ export async function POST(request: NextRequest) {
         if (captchaHandler) {
           const postSubmitCaptcha = await captchaHandler.checkPostSubmitCaptcha(page);
           if (postSubmitCaptcha.detected) {
-            await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve');
+            // Re-use the state machine for post-submit CAPTCHA (uses body as proxy form).
+            await checkAndHandleCaptchaBeforeSubmit('post-submit', page.locator('body'));
           }
         }
         // A button label alone is not proof that the form was submitted. Wait
@@ -470,8 +494,8 @@ export async function POST(request: NextRequest) {
         // manual review instead of producing a false Success result.
         const outcome = await detectSubmissionOutcome(page, beforeUrl, beforeText, beforeFillState.filled);
         if (outcome.status === 'captcha') {
-          const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: outcome.captchaProvider || 'CAPTCHA', reason: outcome.reason, values: session.profile || {} });
-          return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: outcome.captchaProvider || 'CAPTCHA', error: outcome.reason, resultId: result.id, steps }, { status: 409 });
+          const result = addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: page.url(), captchaProvider: outcome.captchaProvider || 'Unknown CAPTCHA / Human Verification', reason: outcome.reason, values: session.profile || {} });
+          return NextResponse.json({ success: false, captchaDetected: true, captchaProvider: outcome.captchaProvider || 'Unknown CAPTCHA / Human Verification', error: outcome.reason, resultId: result.id, steps }, { status: 409 });
         }
         if (outcome.status === 'review') return saveReview(outcome.reason);
 
