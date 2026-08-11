@@ -825,7 +825,7 @@ async function fillForm(page: any, chosen: any, profile: Profile) {
     } else if (hasAnySignal(signals, companyPatterns)) {
       value = companyOrName;
       kind = 'company';
-    } else if (hasAnySignal(signals, [/subject|topic|reason|regarding|nature of inquiry|inquiry type|enquiry type|how can we help|what can we help|sujet|objet|raison|motif|nature de la demande|type de demande|comment pouvons nous vous aider/])) {
+    } else if (tag !== 'textarea' && hasAnySignal(signals, [/subject|topic|reason|regarding|nature of inquiry|inquiry type|enquiry type|what can we help|sujet|objet|raison|motif|nature de la demande|type de demande/])) {
       value = profile.subject || '';
       kind = 'subject';
     } else if (tag === 'textarea' || hasAnySignal(signals, [/message|comment|inquiry|enquiry|description|details|how can we help|tell us|project details|additional information|question|notes|briefly describe|commentaire|demande|détails|details|renseignements supplémentaires|renseignements supplementaires|décrivez|decrivez/])) {
