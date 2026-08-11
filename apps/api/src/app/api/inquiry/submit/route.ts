@@ -415,7 +415,7 @@ export async function POST(request: NextRequest) {
       });
     };
     const throwIfStale = () => {
-      if (!isAttemptActive()) throw new InquiryRunStoppedError();
+      if (!isAttemptActive()) throw new InquiryRunStoppedError('stale_run_context');
     };
     await inquiryCheckpoint(licenseId);
 

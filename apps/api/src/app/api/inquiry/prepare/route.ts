@@ -934,7 +934,7 @@ export async function POST(request: NextRequest) {
       });
     };
     const throwIfStale = () => {
-      if (!isAttemptActive()) throw new InquiryRunStoppedError();
+      if (!isAttemptActive()) throw new InquiryRunStoppedError('stale_run_context');
     };
     const session = await getInquirySession(sessionId, licenseId, true);
     if (!session) throw new Error('Unable to create Inquiry browser session.');

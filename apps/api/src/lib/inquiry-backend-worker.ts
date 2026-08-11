@@ -181,6 +181,8 @@ function canonicalTerminalMessage(args: {
       return `${prefix} — [scan_timeout] scan timed out; browser session recycled and skipped automatically`;
     case 'submit_timeout':
       return `${prefix} — [submit_timeout] submission timed out; browser session recycled and saved for review`;
+    case 'run_context_invalid':
+      return `${prefix} — [run_context_invalid] ${args.detail || 'run context is no longer active; skipped automatically'}`;
     case 'submit_failed':
     default:
       return `${prefix} — [submit_failed] ${args.detail || 'submission/prepare failed'}`;
@@ -340,11 +342,15 @@ export function startInquiryBackendWorker(args: {
         if (!isActiveInquiryItemAttempt(attempt)) continue;
 
         if (!(prepareResponse.ok && prepared?.success)) {
+          const runContextInvalid = prepared?.code === 'RUN_STOPPED';
+          if (runContextInvalid) assertWorkerActive(args.licenseId, args.runId);
           emitTerminal({
             terminalState: 'FAILED',
-            reasonCode: 'submit_failed',
-            level: 'error',
-            detail: `prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`,
+            reasonCode: runContextInvalid ? 'run_context_invalid' : 'submit_failed',
+            level: runContextInvalid ? 'warning' : 'error',
+            detail: runContextInvalid
+              ? prepared?.error || 'Inquiry run context is no longer active.'
+              : `prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`,
           });
           continue;
         }
@@ -469,11 +475,15 @@ export function startInquiryBackendWorker(args: {
               contactUrl: prepared.contactUrl || target,
             });
           } else {
+            const runContextInvalid = submitted?.code === 'RUN_STOPPED';
+            if (runContextInvalid) assertWorkerActive(args.licenseId, args.runId);
             emitTerminal({
               terminalState: 'FAILED',
-              reasonCode: 'submit_failed',
-              level: 'error',
-              detail: submitted?.error || `HTTP ${submitResponse.status}`,
+              reasonCode: runContextInvalid ? 'run_context_invalid' : 'submit_failed',
+              level: runContextInvalid ? 'warning' : 'error',
+              detail: runContextInvalid
+                ? submitted?.error || 'Inquiry run context is no longer active.'
+                : submitted?.error || `HTTP ${submitResponse.status}`,
               contactUrl: prepared.contactUrl || target,
             });
           }
