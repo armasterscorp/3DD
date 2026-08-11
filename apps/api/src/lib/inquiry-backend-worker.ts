@@ -1,9 +1,30 @@
 import { NextRequest } from 'next/server';
 import { POST as prepareInquiry } from '@/app/api/inquiry/prepare/route';
 import { POST as submitInquiry } from '@/app/api/inquiry/submit/route';
-import { addInquiryLog, addInquiryResult, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError, setInquiryRunState } from '@/lib/inquiry-run-store';
+import {
+  addInquiryLog,
+  addInquiryResult,
+  getInquiryRunState,
+  inquiryCheckpoint,
+  InquiryRunStoppedError,
+  setInquiryRunState,
+} from '@/lib/inquiry-run-store';
 import { closeInquirySession } from '@/lib/inquiry-browser-store';
-import { cancelInquiryItemAttempt, finishInquiryItemAttempt, formatAttemptStep, isActiveInquiryItemAttempt, startInquiryItemAttempt, transitionInquiryItemState, type InquiryAttemptRef } from '@/lib/inquiry-item-lifecycle';
+import {
+  canEmitInquiryProgress,
+  cancelInquiryItemAttempt,
+  finishInquiryItemAttempt,
+  formatAttemptStep,
+  getInquiryItemAttempt,
+  isActiveInquiryItemAttempt,
+  registerInquiryItemTimer,
+  renewInquiryItemOperation,
+  startInquiryItemAttempt,
+  transitionInquiryItemState,
+  type InquiryAttemptRef,
+  type InquiryTerminalReasonCode,
+  type InquiryTerminalState,
+} from '@/lib/inquiry-item-lifecycle';
 
 const globalWorkers = globalThis as typeof globalThis & {
   __threeDSuiteInquiryWorkers?: Map<string, Promise<void>>;
@@ -41,7 +62,9 @@ class InquiryTargetTimeoutError extends Error {
     public target: string,
     public timeoutMs: number
   ) {
-    super(`${phase === 'prepare' ? 'Form discovery/preparation' : 'Submission'} timed out after ${Math.round(timeoutMs / 1000)}s`);
+    super(
+      `${phase === 'prepare' ? 'Form discovery/preparation' : 'Submission'} timed out after ${Math.round(timeoutMs / 1000)}s`
+    );
     this.name = 'InquiryTargetTimeoutError';
   }
 }
@@ -59,10 +82,10 @@ async function withTargetWatchdog<T>(args: {
   attempt: InquiryAttemptRef;
 }): Promise<T> {
   const startedAt = Date.now();
-  let finished = false;
+  renewInquiryItemOperation(args.attempt, args.phase === 'prepare' ? 'scan' : 'submit');
 
   const heartbeat = setInterval(() => {
-    if (finished) return;
+    if (!canEmitInquiryProgress(args.attempt)) return;
     const state = getInquiryRunState(args.licenseId);
     if (state.mode === 'stopped' || (state.runId && state.runId !== args.runId)) return;
     const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
@@ -70,34 +93,90 @@ async function withTargetWatchdog<T>(args: {
       licenseId: args.licenseId,
       runId: args.runId,
       level: 'info',
-      message: formatAttemptStep(`${args.index + 1}/${args.total} — still ${args.phase === 'prepare' ? 'scanning' : 'submitting'} ${args.target} (${elapsed}s)`, args.attempt),
+      message: formatAttemptStep(
+        `${args.index + 1}/${args.total} — still ${args.phase === 'prepare' ? 'scanning' : 'submitting'} ${args.target} (${elapsed}s)`,
+        args.attempt
+      ),
       attemptId: args.attempt.attemptId,
       sessionGeneration: args.attempt.sessionGeneration,
       targetIndex: args.attempt.index,
       target: args.target,
     });
   }, 20_000);
+  registerInquiryItemTimer(args.attempt, heartbeat);
 
   let timeoutHandle: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(async () => {
-      cancelInquiryItemAttempt(args.attempt, 'TIMEOUT', `${args.phase}_timeout_${Math.round(args.timeoutMs / 1000)}s`);
+      cancelInquiryItemAttempt(
+        args.attempt,
+        args.phase === 'prepare' ? 'TIMEOUT_SCAN' : 'TIMEOUT_SUBMIT',
+        args.phase === 'prepare' ? 'scan_timeout' : 'submit_timeout',
+        `${args.phase}_timeout_${Math.round(args.timeoutMs / 1000)}s`
+      );
       try {
-        // Closing the licensed Playwright session aborts any navigation/evaluate
-        // that is actually wedged. The next target will recreate the same
-        // license-scoped session automatically in the prepare route.
         await closeInquirySession(args.sessionId, args.licenseId);
       } catch {}
       reject(new InquiryTargetTimeoutError(args.phase, args.target, args.timeoutMs));
     }, args.timeoutMs);
   });
+  if (timeoutHandle) registerInquiryItemTimer(args.attempt, timeoutHandle);
 
   try {
     return await Promise.race([args.task, timeout]);
   } finally {
-    finished = true;
     clearInterval(heartbeat);
     if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+function terminalResultFor(
+  terminalState: InquiryTerminalState,
+  target: string,
+  detail?: string
+): { status: 'submitted' | 'failed' | 'captcha' | 'review'; reason?: string; captchaProvider?: string; contactUrl?: string } | null {
+  switch (terminalState) {
+    case 'SUBMITTED':
+      return { status: 'submitted', reason: detail || 'submitted_success' };
+    case 'SKIPPED_CAPTCHA_REQUIRED':
+      return { status: 'captcha', reason: detail || 'captcha_detected_autoskip', captchaProvider: 'CAPTCHA', contactUrl: target };
+    case 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED':
+      return { status: 'review', reason: detail || 'captcha_required_unsolved', contactUrl: target };
+    case 'TIMEOUT_SUBMIT':
+      return { status: 'review', reason: detail || 'submit_timeout', contactUrl: target };
+    case 'SKIPPED_NO_FORM':
+    case 'TIMEOUT_SCAN':
+    case 'FAILED':
+      return { status: 'failed', reason: detail || 'submit_failed', contactUrl: target };
+    default:
+      return null;
+  }
+}
+
+function canonicalTerminalMessage(args: {
+  index: number;
+  total: number;
+  target: string;
+  reasonCode: InquiryTerminalReasonCode;
+  detail?: string;
+}): string {
+  const prefix = `${args.index + 1}/${args.total} — ${args.target}`;
+  switch (args.reasonCode) {
+    case 'submitted_success':
+      return `${prefix} — [submitted_success] submission confirmed${args.detail ? ` — ${args.detail}` : ''}`;
+    case 'no_form_found':
+      return `${prefix} — [no_form_found] no usable contact/quote/inquiry form found; skipped automatically`;
+    case 'captcha_detected_autoskip':
+      return `${prefix} — [captcha_detected_autoskip] CAPTCHA still required on the active form; saved and skipped automatically`;
+    case 'captcha_required_unsolved':
+      return `${prefix} — [captcha_required_unsolved] CAPTCHA token was not accepted; manual review required`;
+    case 'scan_timeout':
+      return `${prefix} — [scan_timeout] scan timed out; browser session recycled and skipped automatically`;
+    case 'submit_timeout':
+      return `${prefix} — [submit_timeout] submission timed out; browser session recycled and saved for review`;
+    case 'submit_failed':
+    default:
+      return `${prefix} — [submit_failed] ${args.detail || 'submission/prepare failed'}`;
   }
 }
 
@@ -128,7 +207,9 @@ export function startInquiryBackendWorker(args: {
           index: i,
           sessionGeneration,
         });
-        const addAttemptLog = (level: 'info' | 'success' | 'warning' | 'error', message: string) => {
+
+        const addPhaseLog = (level: 'info' | 'success' | 'warning' | 'error', message: string) => {
+          if (!canEmitInquiryProgress(attempt)) return;
           addInquiryLog({
             licenseId: args.licenseId,
             runId: args.runId,
@@ -140,22 +221,55 @@ export function startInquiryBackendWorker(args: {
             target,
           });
         };
-        const addAttemptResult = (input: Omit<Parameters<typeof addInquiryResult>[0], 'licenseId' | 'runId' | 'sessionId' | 'target'> & { status: 'submitted' | 'failed' | 'captcha' | 'review'; reason?: string; contactUrl?: string }) => {
-          if (!isActiveInquiryItemAttempt(attempt)) return null;
-          return addInquiryResult({
+
+        const emitTerminal = (input: {
+          terminalState: InquiryTerminalState;
+          reasonCode: InquiryTerminalReasonCode;
+          level: 'success' | 'warning' | 'error';
+          detail?: string;
+          contactUrl?: string;
+        }): boolean => {
+          const emitted =
+            input.terminalState === 'SUBMITTED'
+              ? finishInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail)
+              : cancelInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail);
+          if (!emitted) return false;
+          const result = terminalResultFor(input.terminalState, input.contactUrl || target, input.detail);
+          if (result) {
+            addInquiryResult({
+              licenseId: args.licenseId,
+              runId: args.runId,
+              sessionId: args.sessionId,
+              target,
+              ...result,
+              contactUrl: input.contactUrl || result.contactUrl,
+              attemptId: attempt.attemptId,
+              sessionGeneration: attempt.sessionGeneration,
+              targetIndex: i,
+            });
+          }
+          addInquiryLog({
             licenseId: args.licenseId,
             runId: args.runId,
-            sessionId: args.sessionId,
-            target,
-            ...input,
+            level: input.level,
+            message: formatAttemptStep(
+              canonicalTerminalMessage({
+                index: i,
+                total: args.targets.length,
+                target,
+                reasonCode: input.reasonCode,
+                detail: input.detail,
+              }),
+              attempt
+            ),
             attemptId: attempt.attemptId,
             sessionGeneration: attempt.sessionGeneration,
-            targetIndex: i,
+            targetIndex: attempt.index,
+            target,
           });
+          return true;
         };
-        // Publish the active target before emitting its runtime log. The dashboard
-        // uses this state to bind the screenshot stream to the same target/index,
-        // avoiding logs visually advancing ahead of the browser preview.
+
         setInquiryRunState(args.licenseId, 'running', {
           runId: args.runId,
           sessionId: args.sessionId,
@@ -164,7 +278,7 @@ export function startInquiryBackendWorker(args: {
           index: i,
           currentTarget: target,
         });
-        addAttemptLog('info', `${i + 1}/${args.targets.length} — checking ${target} for a contact form`);
+        addPhaseLog('info', `${i + 1}/${args.targets.length} — checking ${target} for a contact form`);
 
         let prepareResponse: Response;
         try {
@@ -178,139 +292,204 @@ export function startInquiryBackendWorker(args: {
             phase: 'prepare',
             timeoutMs: INQUIRY_SCAN_TIMEOUT_MS,
             attempt,
-            task: prepareInquiry(requestFor(args.licenseId, '/api/inquiry/prepare', {
-              sessionId: args.sessionId,
-              runId: args.runId,
-              target,
-              profile: args.profile,
-              attemptId: attempt.attemptId,
-              sessionGeneration: attempt.sessionGeneration,
-              targetIndex: i,
-            })),
+            task: prepareInquiry(
+              requestFor(args.licenseId, '/api/inquiry/prepare', {
+                sessionId: args.sessionId,
+                runId: args.runId,
+                target,
+                profile: args.profile,
+                attemptId: attempt.attemptId,
+                sessionGeneration: attempt.sessionGeneration,
+                targetIndex: i,
+              })
+            ),
           });
         } catch (error) {
           assertWorkerActive(args.licenseId, args.runId);
           if (error instanceof InquiryTargetTimeoutError) {
-            const reason = `TARGET_TIMEOUT_${Math.round(error.timeoutMs / 1000)}S`;
-            transitionInquiryItemState(attempt, 'TIMEOUT');
-            addAttemptResult({ status: 'failed', reason });
-            addAttemptLog('warning', `${i + 1}/${args.targets.length} — ${target} — scan timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically`);
-            finishInquiryItemAttempt(attempt, 'TIMEOUT', reason);
+            emitTerminal({
+              terminalState: 'TIMEOUT_SCAN',
+              reasonCode: 'scan_timeout',
+              level: 'warning',
+              detail: `scan timed out after ${Math.round(error.timeoutMs / 1000)}s`,
+            });
             sessionGeneration += 1;
             continue;
           }
-          cancelInquiryItemAttempt(attempt, 'FAILED', 'prepare_exception');
+          cancelInquiryItemAttempt(attempt, 'FAILED', 'submit_failed', 'prepare_exception');
           throw error;
         }
         assertWorkerActive(args.licenseId, args.runId);
         if (!isActiveInquiryItemAttempt(attempt)) continue;
+
         const prepared = await responseJson(prepareResponse);
         assertWorkerActive(args.licenseId, args.runId);
         if (!isActiveInquiryItemAttempt(attempt)) continue;
 
-        if (prepareResponse.ok && prepared?.success) {
-          const classification = String(prepared.classification || (prepared.captchaDetected ? 'captcha' : 'form_found'));
-          if (classification === 'captcha') {
-            addAttemptLog('warning', `${i + 1}/${args.targets.length} — CAPTCHA detected (${prepared.captchaProvider || 'CAPTCHA'}) on ${prepared.contactUrl || target}; saved and skipped automatically`);
-            finishInquiryItemAttempt(attempt, 'SKIPPED', 'captcha_detected');
-          } else if (classification === 'review_required') {
-            addAttemptLog('warning', `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${prepared.contactUrl || target} — ${prepared.reviewReason || 'manual interaction needed'}; saved and skipped automatically`);
-            finishInquiryItemAttempt(attempt, 'REVIEW_REQUIRED', 'prepare_review_required');
-          } else if (classification === 'site_unavailable') {
-            addAttemptLog('warning', `${i + 1}/${args.targets.length} — ${target} — website unavailable (${prepared.unavailableReason || 'SITE_UNAVAILABLE'}); skipped automatically`);
-            finishInquiryItemAttempt(attempt, 'SKIPPED', 'site_unavailable');
-          } else if (classification === 'no_form') {
-            addAttemptLog('warning', `${i + 1}/${args.targets.length} — ${target} — no usable contact/quote/inquiry form found; skipped automatically`);
-            finishInquiryItemAttempt(attempt, 'SKIPPED', 'no_form');
-          } else if (classification === 'form_found') {
-            transitionInquiryItemState(attempt, 'FORM_FOUND');
-            transitionInquiryItemState(attempt, 'READY_TO_SUBMIT');
-            addAttemptLog('success', `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}`);
-            addAttemptLog('info', `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}`);
-            await inquiryCheckpoint(args.licenseId);
-            transitionInquiryItemState(attempt, 'SUBMITTING');
-            let submitResponse: Response;
-            try {
-              submitResponse = await withTargetWatchdog({
-                licenseId: args.licenseId,
-                runId: args.runId,
-                sessionId: args.sessionId,
-                target,
-                index: i,
-                total: args.targets.length,
-                phase: 'submit',
-                timeoutMs: INQUIRY_SUBMIT_TIMEOUT_MS,
-                attempt,
-                task: submitInquiry(requestFor(args.licenseId, '/api/inquiry/submit', {
+        if (!(prepareResponse.ok && prepared?.success)) {
+          emitTerminal({
+            terminalState: 'FAILED',
+            reasonCode: 'submit_failed',
+            level: 'error',
+            detail: `prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`,
+          });
+          continue;
+        }
+
+        const classification = String(prepared.classification || (prepared.captchaDetected ? 'captcha' : 'form_found'));
+        if (classification === 'captcha') {
+          transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
+          transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
+          emitTerminal({
+            terminalState: 'SKIPPED_CAPTCHA_REQUIRED',
+            reasonCode: 'captcha_detected_autoskip',
+            level: 'warning',
+            detail: `${prepared.captchaProvider || 'CAPTCHA'} required on ${prepared.contactUrl || target}`,
+            contactUrl: prepared.contactUrl || target,
+          });
+        } else if (classification === 'review_required') {
+          transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
+          transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
+          emitTerminal({
+            terminalState: 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED',
+            reasonCode: 'captcha_required_unsolved',
+            level: 'warning',
+            detail: prepared.reviewReason || 'manual interaction needed',
+            contactUrl: prepared.contactUrl || target,
+          });
+        } else if (classification === 'site_unavailable') {
+          emitTerminal({
+            terminalState: 'FAILED',
+            reasonCode: 'submit_failed',
+            level: 'warning',
+            detail: `website unavailable (${prepared.unavailableReason || 'SITE_UNAVAILABLE'})`,
+            contactUrl: prepared.contactUrl || target,
+          });
+        } else if (classification === 'no_form') {
+          emitTerminal({
+            terminalState: 'SKIPPED_NO_FORM',
+            reasonCode: 'no_form_found',
+            level: 'warning',
+            detail: prepared.noFormReason,
+            contactUrl: prepared.contactUrl || target,
+          });
+        } else if (classification === 'form_found') {
+          transitionInquiryItemState(attempt, 'FORM_FOUND');
+          transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
+          transitionInquiryItemState(attempt, 'READY_TO_SUBMIT');
+          addPhaseLog('success', `${i + 1}/${args.targets.length} — form found and prepared on ${prepared.contactUrl || target}`);
+          addPhaseLog('info', `${i + 1}/${args.targets.length} — auto-submit — completing review/next steps and submitting ${target}`);
+          await inquiryCheckpoint(args.licenseId);
+          transitionInquiryItemState(attempt, 'SUBMITTING');
+
+          let submitResponse: Response;
+          try {
+            submitResponse = await withTargetWatchdog({
+              licenseId: args.licenseId,
+              runId: args.runId,
+              sessionId: args.sessionId,
+              target,
+              index: i,
+              total: args.targets.length,
+              phase: 'submit',
+              timeoutMs: INQUIRY_SUBMIT_TIMEOUT_MS,
+              attempt,
+              task: submitInquiry(
+                requestFor(args.licenseId, '/api/inquiry/submit', {
                   sessionId: args.sessionId,
                   runId: args.runId,
                   attemptId: attempt.attemptId,
                   sessionGeneration: attempt.sessionGeneration,
                   targetIndex: i,
-                })),
+                })
+              ),
+            });
+          } catch (error) {
+            assertWorkerActive(args.licenseId, args.runId);
+            if (error instanceof InquiryTargetTimeoutError) {
+              emitTerminal({
+                terminalState: 'TIMEOUT_SUBMIT',
+                reasonCode: 'submit_timeout',
+                level: 'warning',
+                detail: `submission timed out after ${Math.round(error.timeoutMs / 1000)}s`,
+                contactUrl: prepared.contactUrl || target,
               });
-            } catch (error) {
-              assertWorkerActive(args.licenseId, args.runId);
-              if (error instanceof InquiryTargetTimeoutError) {
-                const reason = `SUBMIT_TIMEOUT_${Math.round(error.timeoutMs / 1000)}S`;
-                addAttemptResult({
-                  status: 'review',
-                  contactUrl: prepared.contactUrl || target,
-                  reason: `Submission did not reach a reliable terminal state within ${Math.round(error.timeoutMs / 1000)} seconds.`,
-                });
-                addAttemptLog('warning', `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — submission timed out after ${Math.round(error.timeoutMs / 1000)}s; browser session recycled and skipped automatically`);
-                finishInquiryItemAttempt(attempt, 'TIMEOUT', reason);
-                sessionGeneration += 1;
-                continue;
-              }
-              cancelInquiryItemAttempt(attempt, 'FAILED', 'submit_exception');
-              throw error;
+              sessionGeneration += 1;
+              continue;
             }
-            assertWorkerActive(args.licenseId, args.runId);
-            if (!isActiveInquiryItemAttempt(attempt)) continue;
-            const submitted = await responseJson(submitResponse);
-            assertWorkerActive(args.licenseId, args.runId);
-            if (!isActiveInquiryItemAttempt(attempt)) continue;
-            if (submitResponse.ok && submitted?.success) {
-              addAttemptLog('success', `${i + 1}/${args.targets.length} — submission confirmed on ${submitted.currentUrl || prepared.contactUrl || target}${submitted.confirmation ? ` — ${submitted.confirmation}` : ''}`);
-              finishInquiryItemAttempt(attempt, 'DONE', 'submitted');
-            } else if (submitted?.captchaDetected) {
-              addAttemptLog('warning', `${i + 1}/${args.targets.length} — CAPTCHA detected (${submitted.captchaProvider || 'CAPTCHA'}) during review/submit on ${target}; saved and skipped automatically`);
-              finishInquiryItemAttempt(attempt, 'SKIPPED', 'submit_captcha');
-            } else if (submitted?.reviewRequired) {
-              addAttemptLog('warning', `${i + 1}/${args.targets.length} — REVIEW REQUIRED on ${target} — ${submitted.reason || submitted.error || 'manual interaction needed'}; saved and skipped automatically`);
-              finishInquiryItemAttempt(attempt, 'REVIEW_REQUIRED', submitted.reason || submitted.error || 'submit_review_required');
-            } else {
-              addAttemptLog('error', `${i + 1}/${args.targets.length} — ${target} — submit failed: ${submitted?.error || `HTTP ${submitResponse.status}`}`);
-              finishInquiryItemAttempt(attempt, 'FAILED', 'submit_failed');
-            }
+            cancelInquiryItemAttempt(attempt, 'FAILED', 'submit_failed', 'submit_exception');
+            throw error;
           }
-        } else {
-          addAttemptLog('error', `${i + 1}/${args.targets.length} — ${target} — prepare failed: ${prepared?.error || `HTTP ${prepareResponse.status}`}`);
-          finishInquiryItemAttempt(attempt, 'FAILED', 'prepare_failed');
+          assertWorkerActive(args.licenseId, args.runId);
+          if (!isActiveInquiryItemAttempt(attempt)) continue;
+
+          const submitted = await responseJson(submitResponse);
+          assertWorkerActive(args.licenseId, args.runId);
+          if (!isActiveInquiryItemAttempt(attempt)) continue;
+
+          if (submitResponse.ok && submitted?.success) {
+            emitTerminal({
+              terminalState: 'SUBMITTED',
+              reasonCode: 'submitted_success',
+              level: 'success',
+              detail: submitted.confirmation || submitted.currentUrl || prepared.contactUrl || target,
+              contactUrl: submitted.currentUrl || prepared.contactUrl || target,
+            });
+          } else if (submitted?.captchaDetected) {
+            transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
+            transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
+            emitTerminal({
+              terminalState: 'SKIPPED_CAPTCHA_REQUIRED',
+              reasonCode: 'captcha_detected_autoskip',
+              level: 'warning',
+              detail: `${submitted.captchaProvider || 'CAPTCHA'} required during submit`,
+              contactUrl: prepared.contactUrl || target,
+            });
+          } else if (submitted?.reviewRequired) {
+            transitionInquiryItemState(attempt, 'CAPTCHA_CHECKING');
+            transitionInquiryItemState(attempt, 'CAPTCHA_REQUIRED');
+            emitTerminal({
+              terminalState: 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED',
+              reasonCode: 'captcha_required_unsolved',
+              level: 'warning',
+              detail: submitted.reason || submitted.error || 'manual interaction needed',
+              contactUrl: prepared.contactUrl || target,
+            });
+          } else {
+            emitTerminal({
+              terminalState: 'FAILED',
+              reasonCode: 'submit_failed',
+              level: 'error',
+              detail: submitted?.error || `HTTP ${submitResponse.status}`,
+              contactUrl: prepared.contactUrl || target,
+            });
+          }
         }
 
-        // Live-monitor guarantee: do not replace the terminal page immediately.
-        // At 250ms screenshot polling this gives several frames of every target's
-        // final visible state (success/review/captcha/no-form) before advancing.
         assertWorkerActive(args.licenseId, args.runId);
         await new Promise((resolve) => setTimeout(resolve, 1800));
         assertWorkerActive(args.licenseId, args.runId);
 
-        // Persist the next position only while this exact run is still active.
-        // A stopped run is terminal and must never be resurrected as "running".
-        setInquiryRunState(args.licenseId, 'running', {
-          runId: args.runId,
-          sessionId: args.sessionId,
-          targets: args.targets,
-          totalTargets: args.targets.length,
-          index: Math.min(i + 1, args.targets.length - 1),
-          currentTarget: args.targets[i + 1] || '',
-        });
+        const snapshot = getInquiryItemAttempt(attempt);
+        if (snapshot?.terminalEmitted) {
+          setInquiryRunState(args.licenseId, 'running', {
+            runId: args.runId,
+            sessionId: args.sessionId,
+            targets: args.targets,
+            totalTargets: args.targets.length,
+            index: Math.min(i + 1, args.targets.length - 1),
+            currentTarget: args.targets[i + 1] || '',
+          });
+        }
       }
 
       assertWorkerActive(args.licenseId, args.runId);
-      addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'success', message: `Inquiry automatic run complete — ${args.targets.length}/${args.targets.length} processed` });
+      addInquiryLog({
+        licenseId: args.licenseId,
+        runId: args.runId,
+        level: 'success',
+        message: `Inquiry automatic run complete — ${args.targets.length}/${args.targets.length} processed`,
+      });
       setInquiryRunState(args.licenseId, 'complete', {
         runId: args.runId,
         sessionId: args.sessionId,
@@ -321,9 +500,11 @@ export function startInquiryBackendWorker(args: {
       });
     } catch (error) {
       const current = getInquiryRunState(args.licenseId);
-      const explicitlyStopped = error instanceof InquiryRunStoppedError || current.mode === 'stopped' || (current.runId && current.runId !== args.runId);
+      const explicitlyStopped =
+        error instanceof InquiryRunStoppedError ||
+        current.mode === 'stopped' ||
+        (current.runId && current.runId !== args.runId);
       if (!explicitlyStopped) {
-        // Unexpected worker failure: freeze the run at its last known target.
         setInquiryRunState(args.licenseId, 'stopped', {
           runId: args.runId,
           sessionId: args.sessionId,
@@ -332,11 +513,16 @@ export function startInquiryBackendWorker(args: {
           index: current.index,
           currentTarget: current.currentTarget,
         });
-        addInquiryLog({ licenseId: args.licenseId, runId: args.runId, level: 'error', message: `Inquiry backend worker stopped with error — ${error instanceof Error ? error.message : String(error)}` });
+        addInquiryLog({
+          licenseId: args.licenseId,
+          runId: args.runId,
+          level: 'error',
+          message: `Inquiry backend worker stopped with error — ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        });
         console.error('[inquiry-worker]', error);
       }
-      // Whether Stop was explicit or caused by an unexpected failure, do not leave
-      // an owned browser process running for this worker.
       await closeInquirySession(args.sessionId, args.licenseId).catch(() => undefined);
     } finally {
       workers.delete(key);

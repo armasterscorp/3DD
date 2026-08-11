@@ -1,16 +1,43 @@
 export type InquiryItemState =
+  | 'PENDING'
   | 'SCANNING'
   | 'FORM_FOUND'
+  | 'CAPTCHA_CHECKING'
+  | 'CAPTCHA_REQUIRED'
   | 'CAPTCHA_SOLVING'
+  | 'CAPTCHA_VERIFIED'
+  | 'CAPTCHA_FAILED'
   | 'READY_TO_SUBMIT'
   | 'SUBMITTING'
-  | 'DONE'
-  | 'SKIPPED'
-  | 'REVIEW_REQUIRED'
-  | 'TIMEOUT'
+  | 'SUBMITTED'
+  | 'SKIPPED_NO_FORM'
+  | 'SKIPPED_CAPTCHA_REQUIRED'
+  | 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED'
+  | 'TIMEOUT_SCAN'
+  | 'TIMEOUT_SUBMIT'
   | 'FAILED';
 
-type TerminalState = Extract<InquiryItemState, 'DONE' | 'SKIPPED' | 'REVIEW_REQUIRED' | 'TIMEOUT' | 'FAILED'>;
+export type InquiryTerminalState = Extract<
+  InquiryItemState,
+  | 'SUBMITTED'
+  | 'SKIPPED_NO_FORM'
+  | 'SKIPPED_CAPTCHA_REQUIRED'
+  | 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED'
+  | 'TIMEOUT_SCAN'
+  | 'TIMEOUT_SUBMIT'
+  | 'FAILED'
+>;
+
+export type InquiryTerminalReasonCode =
+  | 'no_form_found'
+  | 'captcha_required_unsolved'
+  | 'captcha_detected_autoskip'
+  | 'scan_timeout'
+  | 'submit_timeout'
+  | 'submit_failed'
+  | 'submitted_success';
+
+export type InquiryOperationKind = 'scan' | 'captcha' | 'submit';
 
 export type InquiryAttemptRef = {
   licenseId: string;
@@ -23,11 +50,22 @@ export type InquiryAttemptRef = {
 
 type StoredAttempt = InquiryAttemptRef & {
   state: InquiryItemState;
-  terminalState?: TerminalState;
-  terminalReason?: string;
   createdAt: string;
   updatedAt: string;
-  abortController: AbortController;
+  cancelledAt?: string;
+  terminalState?: InquiryTerminalState;
+  terminalReason?: string;
+  terminalReasonCode?: InquiryTerminalReasonCode;
+  terminalEmitted: boolean;
+  controllers: Record<InquiryOperationKind, AbortController>;
+  timers: Set<NodeJS.Timeout>;
+  invalidTransitionDebugKeys: Set<string>;
+  debugEvents: string[];
+  attemptSequence: number;
+};
+
+export type InquiryItemSnapshot = Omit<StoredAttempt, 'controllers' | 'timers' | 'invalidTransitionDebugKeys' | 'debugEvents'> & {
+  aborted: boolean;
 };
 
 const globalStore = globalThis as typeof globalThis & {
@@ -40,86 +78,279 @@ function keyOf(ref: Pick<InquiryAttemptRef, 'licenseId' | 'runId' | 'target' | '
   return `${ref.licenseId}::${ref.runId}::${ref.index}::${ref.target.toLowerCase()}`;
 }
 
+function buildControllerBag() {
+  return {
+    scan: new AbortController(),
+    captcha: new AbortController(),
+    submit: new AbortController(),
+  } satisfies Record<InquiryOperationKind, AbortController>;
+}
+
 const transitions: Record<InquiryItemState, InquiryItemState[]> = {
-  SCANNING: ['FORM_FOUND', 'CAPTCHA_SOLVING', 'SKIPPED', 'REVIEW_REQUIRED', 'TIMEOUT', 'FAILED'],
-  FORM_FOUND: ['CAPTCHA_SOLVING', 'READY_TO_SUBMIT', 'SKIPPED', 'REVIEW_REQUIRED', 'TIMEOUT', 'FAILED'],
-  CAPTCHA_SOLVING: ['READY_TO_SUBMIT', 'REVIEW_REQUIRED', 'SKIPPED', 'TIMEOUT', 'FAILED'],
-  READY_TO_SUBMIT: ['SUBMITTING', 'REVIEW_REQUIRED', 'SKIPPED', 'TIMEOUT', 'FAILED'],
-  SUBMITTING: ['DONE', 'REVIEW_REQUIRED', 'SKIPPED', 'TIMEOUT', 'FAILED'],
-  DONE: [],
-  SKIPPED: [],
-  REVIEW_REQUIRED: [],
-  TIMEOUT: [],
+  PENDING: ['SCANNING'],
+  SCANNING: ['FORM_FOUND', 'CAPTCHA_CHECKING', 'SKIPPED_NO_FORM', 'SKIPPED_CAPTCHA_REQUIRED', 'TIMEOUT_SCAN', 'FAILED'],
+  FORM_FOUND: ['CAPTCHA_CHECKING', 'READY_TO_SUBMIT', 'FAILED'],
+  CAPTCHA_CHECKING: ['CAPTCHA_REQUIRED', 'READY_TO_SUBMIT', 'CAPTCHA_VERIFIED', 'FAILED'],
+  CAPTCHA_REQUIRED: ['CAPTCHA_SOLVING', 'SKIPPED_CAPTCHA_REQUIRED', 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED', 'FAILED'],
+  CAPTCHA_SOLVING: ['CAPTCHA_VERIFIED', 'CAPTCHA_FAILED', 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED', 'FAILED'],
+  CAPTCHA_VERIFIED: ['READY_TO_SUBMIT', 'SUBMITTING', 'FAILED'],
+  CAPTCHA_FAILED: ['REVIEW_REQUIRED_CAPTCHA_UNSOLVED', 'FAILED'],
+  READY_TO_SUBMIT: ['SUBMITTING', 'FAILED'],
+  SUBMITTING: ['SUBMITTED', 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED', 'TIMEOUT_SUBMIT', 'FAILED'],
+  SUBMITTED: [],
+  SKIPPED_NO_FORM: [],
+  SKIPPED_CAPTCHA_REQUIRED: [],
+  REVIEW_REQUIRED_CAPTCHA_UNSOLVED: [],
+  TIMEOUT_SCAN: [],
+  TIMEOUT_SUBMIT: [],
   FAILED: [],
 };
+
+function abortController(controller: AbortController, reason: string): void {
+  if (!controller.signal.aborted) controller.abort(reason);
+}
+
+function abortAllControllers(current: StoredAttempt, reason: string): void {
+  abortController(current.controllers.scan, reason);
+  abortController(current.controllers.captcha, reason);
+  abortController(current.controllers.submit, reason);
+}
+
+function clearTimers(current: StoredAttempt): void {
+  for (const timer of current.timers) clearTimeout(timer);
+  current.timers.clear();
+}
+
+function pushDebug(current: StoredAttempt, message: string): void {
+  current.debugEvents.push(message);
+  if (current.debugEvents.length > 50) current.debugEvents = current.debugEvents.slice(-50);
+}
+
+function isCurrentStoredAttempt(current: StoredAttempt | undefined, ref: InquiryAttemptRef): current is StoredAttempt {
+  return !!current && current.attemptId === ref.attemptId && current.sessionGeneration === ref.sessionGeneration;
+}
+
+function currentFor(ref: InquiryAttemptRef): StoredAttempt | null {
+  const current = attempts.get(keyOf(ref));
+  if (!isCurrentStoredAttempt(current, ref)) return null;
+  return current;
+}
+
+function isTerminalState(state: InquiryItemState): state is InquiryTerminalState {
+  return (
+    state === 'SUBMITTED' ||
+    state === 'SKIPPED_NO_FORM' ||
+    state === 'SKIPPED_CAPTCHA_REQUIRED' ||
+    state === 'REVIEW_REQUIRED_CAPTCHA_UNSOLVED' ||
+    state === 'TIMEOUT_SCAN' ||
+    state === 'TIMEOUT_SUBMIT' ||
+    state === 'FAILED'
+  );
+}
+
+function snapshotOf(current: StoredAttempt): InquiryItemSnapshot {
+  return {
+    ...current,
+    aborted:
+      current.controllers.scan.signal.aborted ||
+      current.controllers.captcha.signal.aborted ||
+      current.controllers.submit.signal.aborted,
+  };
+}
 
 export function startInquiryItemAttempt(input: Omit<InquiryAttemptRef, 'attemptId'> & { attemptId?: string }): InquiryAttemptRef {
   const key = keyOf(input);
   const previous = attempts.get(key);
   if (previous) {
-    previous.abortController.abort('superseded');
+    clearTimers(previous);
+    abortAllControllers(previous, 'superseded');
   }
-  const attemptId = input.attemptId || `att_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+  const attemptSequence = (previous?.attemptSequence || 0) + 1;
+  const attemptId = input.attemptId || `attempt-${attemptSequence}`;
   const now = new Date().toISOString();
   const stored: StoredAttempt = {
     ...input,
     attemptId,
-    state: 'SCANNING',
+    state: 'PENDING',
     createdAt: now,
     updatedAt: now,
-    abortController: new AbortController(),
+    terminalEmitted: false,
+    controllers: buildControllerBag(),
+    timers: new Set<NodeJS.Timeout>(),
+    invalidTransitionDebugKeys: new Set<string>(),
+    debugEvents: [],
+    attemptSequence,
   };
   attempts.set(key, stored);
-  return { ...stored };
+  transitionInquiryItemState({ ...stored }, 'SCANNING');
+  return {
+    licenseId: stored.licenseId,
+    runId: stored.runId,
+    target: stored.target,
+    index: stored.index,
+    attemptId: stored.attemptId,
+    sessionGeneration: stored.sessionGeneration,
+  };
 }
 
 export function isCurrentInquiryItemAttempt(ref: InquiryAttemptRef): boolean {
-  const current = attempts.get(keyOf(ref));
-  if (!current) return false;
-  return current.attemptId === ref.attemptId && current.sessionGeneration === ref.sessionGeneration;
+  return currentFor(ref) !== null;
 }
 
 export function isActiveInquiryItemAttempt(ref: InquiryAttemptRef): boolean {
-  const current = attempts.get(keyOf(ref));
+  const current = currentFor(ref);
   if (!current) return false;
-  if (current.attemptId !== ref.attemptId || current.sessionGeneration !== ref.sessionGeneration) return false;
-  if (current.terminalState) return false;
-  return !current.abortController.signal.aborted;
+  if (current.cancelledAt || current.terminalState) return false;
+  return !current.controllers.scan.signal.aborted;
 }
 
-export function getInquiryItemAttemptSignal(ref: InquiryAttemptRef): AbortSignal | null {
-  const current = attempts.get(keyOf(ref));
-  if (!current) return null;
-  if (current.attemptId !== ref.attemptId || current.sessionGeneration !== ref.sessionGeneration) return null;
-  return current.abortController.signal;
+export function getInquiryItemAttemptSignal(ref: InquiryAttemptRef, operation: InquiryOperationKind = 'scan'): AbortSignal | null {
+  const current = currentFor(ref);
+  return current ? current.controllers[operation].signal : null;
+}
+
+export function getInquiryItemAttempt(ref: InquiryAttemptRef): InquiryItemSnapshot | null {
+  const current = currentFor(ref);
+  return current ? snapshotOf(current) : null;
+}
+
+export function isTerminalInquiryItemState(state: InquiryItemState): state is InquiryTerminalState {
+  return isTerminalState(state);
+}
+
+export function isTerminalInquiryItemAttempt(ref: InquiryAttemptRef): boolean {
+  const current = currentFor(ref);
+  return !!current?.terminalState;
+}
+
+export function canEmitInquiryProgress(ref: InquiryAttemptRef): boolean {
+  const current = currentFor(ref);
+  return !!current && !current.terminalState && !current.cancelledAt && !current.controllers.scan.signal.aborted;
+}
+
+export function drainInquiryItemDebugEvents(ref: InquiryAttemptRef): string[] {
+  const current = currentFor(ref);
+  if (!current) return [];
+  const entries = [...current.debugEvents];
+  current.debugEvents = [];
+  return entries;
+}
+
+export function registerInquiryItemTimer(ref: InquiryAttemptRef, timer: NodeJS.Timeout): boolean {
+  const current = currentFor(ref);
+  if (!current || current.terminalState) {
+    clearTimeout(timer);
+    return false;
+  }
+  current.timers.add(timer);
+  return true;
+}
+
+export function clearInquiryItemTimer(ref: InquiryAttemptRef, timer: NodeJS.Timeout): void {
+  const current = currentFor(ref);
+  clearTimeout(timer);
+  current?.timers.delete(timer);
+}
+
+export function renewInquiryItemOperation(ref: InquiryAttemptRef, operation: InquiryOperationKind): AbortSignal | null {
+  const current = currentFor(ref);
+  if (!current || current.terminalState) return null;
+  abortController(current.controllers[operation], `${operation}_renewed`);
+  current.controllers[operation] = new AbortController();
+  current.updatedAt = new Date().toISOString();
+  return current.controllers[operation].signal;
+}
+
+export function abortInquiryItemOperations(
+  ref: InquiryAttemptRef,
+  reason: string,
+  operations?: InquiryOperationKind[]
+): boolean {
+  const current = currentFor(ref);
+  if (!current) return false;
+  const targets = operations || (['scan', 'captcha', 'submit'] as InquiryOperationKind[]);
+  for (const operation of targets) abortController(current.controllers[operation], reason);
+  current.updatedAt = new Date().toISOString();
+  return true;
 }
 
 export function transitionInquiryItemState(ref: InquiryAttemptRef, next: InquiryItemState): boolean {
-  const current = attempts.get(keyOf(ref));
+  const current = currentFor(ref);
   if (!current) return false;
-  if (current.attemptId !== ref.attemptId || current.sessionGeneration !== ref.sessionGeneration) return false;
+  if (current.terminalState) {
+    pushDebug(
+      current,
+      `[debug] invalid transition ignored item=${current.index + 1} attempt=${current.attemptId} from=${current.state} to=${next}`
+    );
+    return false;
+  }
   if (current.state === next) return true;
-  if (!transitions[current.state].includes(next)) return false;
+  if (!transitions[current.state].includes(next)) {
+    const debugKey = `${current.state}->${next}`;
+    if (!current.invalidTransitionDebugKeys.has(debugKey)) {
+      current.invalidTransitionDebugKeys.add(debugKey);
+      pushDebug(
+        current,
+        `[debug] invalid transition ignored item=${current.index + 1} attempt=${current.attemptId} from=${current.state} to=${next}`
+      );
+    }
+    return false;
+  }
   current.state = next;
   current.updatedAt = new Date().toISOString();
   return true;
 }
 
-export function finishInquiryItemAttempt(ref: InquiryAttemptRef, terminalState: TerminalState, reason?: string): boolean {
-  const current = attempts.get(keyOf(ref));
+export function emitInquiryItemTerminal(
+  ref: InquiryAttemptRef,
+  terminalState: InquiryTerminalState,
+  reasonCode: InquiryTerminalReasonCode,
+  reason?: string
+): boolean {
+  const current = currentFor(ref);
   if (!current) return false;
-  if (current.attemptId !== ref.attemptId || current.sessionGeneration !== ref.sessionGeneration) return false;
-  if (current.terminalState) return false;
-  if (!transitionInquiryItemState(ref, terminalState)) return false;
+  if (current.terminalEmitted || current.terminalState) return false;
+  if (!isTerminalState(terminalState)) return false;
+  const transitionAllowed = current.state === terminalState || transitions[current.state].includes(terminalState);
+  if (!transitionAllowed) {
+    const debugKey = `${current.state}->${terminalState}`;
+    if (!current.invalidTransitionDebugKeys.has(debugKey)) {
+      current.invalidTransitionDebugKeys.add(debugKey);
+      pushDebug(
+        current,
+        `[debug] invalid terminal transition ignored item=${current.index + 1} attempt=${current.attemptId} from=${current.state} to=${terminalState}`
+      );
+    }
+    return false;
+  }
+  current.state = terminalState;
   current.terminalState = terminalState;
-  current.terminalReason = reason;
-  current.abortController.abort(reason || terminalState);
-  current.updatedAt = new Date().toISOString();
+  current.terminalReasonCode = reasonCode;
+  current.terminalReason = reason || reasonCode;
+  current.terminalEmitted = true;
+  current.cancelledAt = new Date().toISOString();
+  current.updatedAt = current.cancelledAt;
+  clearTimers(current);
+  abortAllControllers(current, reason || reasonCode);
   return true;
 }
 
-export function cancelInquiryItemAttempt(ref: InquiryAttemptRef, terminalState: Exclude<TerminalState, 'DONE'>, reason?: string): boolean {
-  return finishInquiryItemAttempt(ref, terminalState, reason);
+export function finishInquiryItemAttempt(
+  ref: InquiryAttemptRef,
+  terminalState: InquiryTerminalState,
+  reasonCode: InquiryTerminalReasonCode,
+  reason?: string
+): boolean {
+  return emitInquiryItemTerminal(ref, terminalState, reasonCode, reason);
+}
+
+export function cancelInquiryItemAttempt(
+  ref: InquiryAttemptRef,
+  terminalState: Exclude<InquiryTerminalState, 'SUBMITTED'>,
+  reasonCode: Exclude<InquiryTerminalReasonCode, 'submitted_success'>,
+  reason?: string
+): boolean {
+  return emitInquiryItemTerminal(ref, terminalState, reasonCode, reason);
 }
 
 export function formatAttemptStep(message: string, ref: Pick<InquiryAttemptRef, 'attemptId' | 'sessionGeneration'>): string {
