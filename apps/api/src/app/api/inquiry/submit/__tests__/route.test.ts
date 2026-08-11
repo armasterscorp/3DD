@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyCaptchaAfterToken, shouldAttemptPreSubmitCaptchaSolve } from '../route';
+import { classifyCaptchaAfterToken, shouldAttemptPreSubmitCaptchaSolve } from '../../../../../lib/inquiry-submit-captcha-policy';
 
 describe('inquiry submit captcha gating', () => {
   it('does not attempt pre-submit solve when captcha is not detected', () => {

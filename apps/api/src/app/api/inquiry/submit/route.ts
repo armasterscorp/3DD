@@ -4,18 +4,10 @@ import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunStat
 import { CaptchaStore } from '@/lib/captcha-store';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
 import { formatAttemptStep, getInquiryItemAttemptSignal, isActiveInquiryItemAttempt, type InquiryAttemptRef } from '@/lib/inquiry-item-lifecycle';
+import { classifyCaptchaAfterToken, shouldAttemptPreSubmitCaptchaSolve } from '@/lib/inquiry-submit-captcha-policy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-
-export function shouldAttemptPreSubmitCaptchaSolve(captchaDetected: boolean): boolean {
-  return captchaDetected;
-}
-
-export function classifyCaptchaAfterToken(stillRequired: boolean): { reviewRequired: boolean; reasonCode?: string } {
-  if (!stillRequired) return { reviewRequired: false };
-  return { reviewRequired: true, reasonCode: 'captcha_unsolved_after_token' };
-}
 
 async function visualSubmitPause(page: any, ms = 550): Promise<void> {
   try { await page.waitForTimeout(ms); } catch {}
