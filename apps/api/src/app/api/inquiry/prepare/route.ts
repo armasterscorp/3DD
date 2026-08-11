@@ -7,6 +7,7 @@ import { formatAttemptStep, getInquiryItemAttemptSignal, isActiveInquiryItemAtte
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+const INQUIRY_CAPTCHA_TIMEOUT_MS = 75_000;
 
 type Profile = {
   firstName?: string;
@@ -961,7 +962,7 @@ export async function POST(request: NextRequest) {
         const result = await Promise.race([
           captchaHandler.handleCaptcha(page),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) =>
-            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'captcha_timeout_after_75_seconds' }), 75_000)
+            setTimeout(() => resolve({ handled: false, status: 'failed', error: 'captcha_timeout_after_75_seconds' }), INQUIRY_CAPTCHA_TIMEOUT_MS)
           ),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) => {
             if (!attemptSignal) return;

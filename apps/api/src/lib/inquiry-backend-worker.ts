@@ -11,6 +11,9 @@ const globalWorkers = globalThis as typeof globalThis & {
 const workers = globalWorkers.__threeDSuiteInquiryWorkers ?? new Map<string, Promise<void>>();
 if (!globalWorkers.__threeDSuiteInquiryWorkers) globalWorkers.__threeDSuiteInquiryWorkers = workers;
 
+const INQUIRY_SCAN_TIMEOUT_MS = 75_000;
+const INQUIRY_SUBMIT_TIMEOUT_MS = 35_000;
+
 function requestFor(licenseId: string, path: string, payload: unknown): NextRequest {
   return new NextRequest(`http://inquiry.internal${path}`, {
     method: 'POST',
@@ -173,7 +176,7 @@ export function startInquiryBackendWorker(args: {
             index: i,
             total: args.targets.length,
             phase: 'prepare',
-            timeoutMs: 75_000,
+            timeoutMs: INQUIRY_SCAN_TIMEOUT_MS,
             attempt,
             task: prepareInquiry(requestFor(args.licenseId, '/api/inquiry/prepare', {
               sessionId: args.sessionId,
@@ -236,7 +239,7 @@ export function startInquiryBackendWorker(args: {
                 index: i,
                 total: args.targets.length,
                 phase: 'submit',
-                timeoutMs: 35_000,
+                timeoutMs: INQUIRY_SUBMIT_TIMEOUT_MS,
                 attempt,
                 task: submitInquiry(requestFor(args.licenseId, '/api/inquiry/submit', {
                   sessionId: args.sessionId,
