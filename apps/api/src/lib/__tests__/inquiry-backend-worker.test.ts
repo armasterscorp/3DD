@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const prepareMock = vi.fn();
-const submitMock = vi.fn();
-const closeSessionMock = vi.fn(async () => undefined);
+const { prepareMock, submitMock, closeSessionMock } = vi.hoisted(() => ({
+  prepareMock: vi.fn(),
+  submitMock: vi.fn(),
+  closeSessionMock: vi.fn(async () => undefined),
+}));
 
 vi.mock('@/app/api/inquiry/prepare/route', () => ({ POST: prepareMock }));
 vi.mock('@/app/api/inquiry/submit/route', () => ({ POST: submitMock }));
@@ -40,7 +42,7 @@ describe('inquiry backend worker', () => {
 
   it('processes 10 leads without immediate run_context_invalid flood and logs completion breakdown', async () => {
     const licenseId = 'worker-a';
-    const runId = 'run-worker-a';
+    const runId = `run-worker-a-${Math.random().toString(36).slice(2, 8)}`;
     const sessionId = 'sessionaaa';
     const targets = Array.from({ length: 10 }, (_, i) => `lead-${i + 1}.example.com`);
 
@@ -52,7 +54,7 @@ describe('inquiry backend worker', () => {
         contactUrl: `https://${String(body.target)}/contact`,
       });
     });
-    submitMock.mockResolvedValue(
+    submitMock.mockImplementation(async () =>
       Response.json({
         success: true,
         confirmation: 'mock submission confirmed',
@@ -77,7 +79,7 @@ describe('inquiry backend worker', () => {
 
   it('aborts once with a single run-level fatal when the run context is missing', async () => {
     const licenseId = 'worker-b';
-    const runId = 'run-worker-b';
+    const runId = `run-worker-b-${Math.random().toString(36).slice(2, 8)}`;
     const sessionId = 'sessionbbb';
     const targets = ['fatal.example.com', 'ignored.example.com'];
 

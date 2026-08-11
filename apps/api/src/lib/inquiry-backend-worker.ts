@@ -276,16 +276,21 @@ export function startInquiryBackendWorker(args: {
         };
 
         const emitTerminal = (input: {
-          terminalState: InquiryTerminalState;
-          reasonCode: InquiryTerminalReasonCode;
+          terminalState: 'SUBMITTED';
+          reasonCode: 'submitted_success';
+          level: 'success';
+          detail?: string;
+          contactUrl?: string;
+        } | {
+          terminalState: Exclude<InquiryTerminalState, 'SUBMITTED'>;
+          reasonCode: Exclude<InquiryTerminalReasonCode, 'submitted_success'>;
           level: 'success' | 'warning' | 'error';
           detail?: string;
           contactUrl?: string;
         }): boolean => {
-          const emitted =
-            input.terminalState === 'SUBMITTED'
-              ? finishInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail)
-              : cancelInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail);
+          const emitted = input.terminalState === 'SUBMITTED'
+            ? finishInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail)
+            : cancelInquiryItemAttempt(attempt, input.terminalState, input.reasonCode, input.detail);
           if (!emitted) return false;
           const result = terminalResultFor(input.terminalState, input.contactUrl || target, input.detail);
           if (result) {
