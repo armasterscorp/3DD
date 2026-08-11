@@ -380,8 +380,18 @@ export async function POST(request: NextRequest) {
     const captchaConfig = await CaptchaStore.getCaptchaConfig(licenseId);
     const savedApiKey = captchaConfig?.isActive ? captchaConfig.apiKey : '';
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    // Logging: same single state-machine rules as prepare route.
+    // 'not_found' is silent — the caller's detectCaptcha() is authoritative.
+    // 'solver_unavailable' emits a one-time warning only on first call.
+    let solverUnavailableLogged = false;
     const solveCaptchaWithTimeout = async (message: string) => {
-      if (!captchaHandler) return { status: 'unconfigured' as const };
+      if (!captchaHandler) {
+        if (!solverUnavailableLogged) {
+          addInquiryLog({ licenseId, runId, level: 'info', message: 'CAPTCHA auto-solver not configured — CAPTCHA will not be solved automatically' });
+          solverUnavailableLogged = true;
+        }
+        return { status: 'solver_unavailable' as const };
+      }
       addInquiryLog({ licenseId, runId, level: 'info', message });
       try {
         const result = await Promise.race([
@@ -405,11 +415,10 @@ export async function POST(request: NextRequest) {
           } else {
             addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA cleared on ${String(page.url?.() || '')}` });
           }
-        } else if (result.status === 'not_found') {
-          addInquiryLog({ licenseId, runId, level: 'info', message: 'no CAPTCHA detected' });
         } else if (result.status === 'failed') {
-          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${'error' in result && result.error ? ` (${result.error})` : ''}` });
         }
+        // 'not_found' and 'solver_unavailable' are silent here.
         return result;
       } catch (error) {
         addInquiryLog({
@@ -421,6 +430,11 @@ export async function POST(request: NextRequest) {
         return { handled: false, status: 'failed' as const };
       }
     };
+    // Bounded retries for post-transition submit recovery.
+    // After a post-submit CAPTCHA is solved and the submit action is retried,
+    // allow at most MAX_POST_SOLVE_RETRIES extra attempts before giving up.
+    const MAX_POST_SOLVE_RETRIES = 2;
+    let postSolveRetries = 0;
 
     // Some inquiry forms use Next/Continue -> Review -> Submit. Walk those
     // visible form actions automatically, but stop on CAPTCHA or if the form
@@ -535,6 +549,16 @@ export async function POST(request: NextRequest) {
                 return saveCaptcha(afterSolveOutcome.captchaProvider || 'CAPTCHA', afterSolveOutcome.reason);
               }
               addInquiryLog({ licenseId, runId, level: 'info', message: '✓ CAPTCHA solved; retrying final Submit/Send action with injected token' });
+              if (postSolveRetries >= MAX_POST_SOLVE_RETRIES) {
+                // Bounded retries exhausted — save for manual review rather than
+                // looping indefinitely.
+                addInquiryLog({
+                  licenseId, runId, level: 'warning',
+                  message: `Post-solve submit retry limit (${MAX_POST_SOLVE_RETRIES}) reached; saving for review`,
+                });
+                return saveReview(`Manual review required: post-CAPTCHA submit retried ${MAX_POST_SOLVE_RETRIES} time(s) without confirmation.`);
+              }
+              postSolveRetries += 1;
               continue;
             }
           }

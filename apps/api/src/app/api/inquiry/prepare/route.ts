@@ -893,8 +893,21 @@ export async function POST(request: NextRequest) {
     const captchaConfig = await CaptchaStore.getCaptchaConfig(licenseId);
     const savedApiKey = captchaConfig?.isActive ? captchaConfig.apiKey : '';
     const captchaHandler = savedApiKey ? new InquiryCaptchaHandler(licenseId, runId, savedApiKey) : null;
+    // Attempt to auto-solve any CAPTCHA on the current page.
+    // Logging rules (single state-machine, no contradictions):
+    //   • "solver unavailable"  – API key not configured; emitted once per run.
+    //   • "✓ CAPTCHA cleared"   – token accepted, page no longer shows a challenge.
+    //   • "CAPTCHA still required" – token returned but page still blocked.
+    //   • "⚠ CAPTCHA solving failed" – solver threw or timed out.
+    // The "no CAPTCHA detected" signal is intentionally NOT emitted here because
+    // the caller always performs its own authoritative detectCaptcha() check
+    // afterwards; emitting it inside the solver would produce contradictory log
+    // pairs ("no CAPTCHA detected" → "CAPTCHA detected on the landing page").
     const solvePreloadCaptcha = async () => {
-      if (!captchaHandler) return { status: 'unconfigured' as const };
+      if (!captchaHandler) {
+        addInquiryLog({ licenseId, runId, level: 'info', message: 'CAPTCHA auto-solver not configured — CAPTCHA will not be solved automatically' });
+        return { status: 'solver_unavailable' as const };
+      }
       const captchaCheckUrl = String(page.url?.() || target);
       addInquiryLog({ licenseId, runId, level: 'info', message: `checking CAPTCHA on ${captchaCheckUrl}` });
       try {
@@ -919,11 +932,11 @@ export async function POST(request: NextRequest) {
           } else {
             addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA cleared on ${String(page.url?.() || captchaCheckUrl)}` });
           }
-        } else if (result.status === 'not_found') {
-          addInquiryLog({ licenseId, runId, level: 'info', message: `no CAPTCHA detected on ${String(page.url?.() || captchaCheckUrl)}` });
         } else if (result.status === 'failed') {
-          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${result.error ? ` (${result.error})` : ''}` });
+          addInquiryLog({ licenseId, runId, level: 'warning', message: `⚠ CAPTCHA solving failed, continuing anyway${'error' in result && result.error ? ` (${result.error})` : ''}` });
         }
+        // 'not_found' and 'solver_unavailable' produce no log here; the caller's
+        // detectCaptcha() check provides the definitive state-machine transition.
         return result;
       } catch (error) {
         addInquiryLog({
@@ -1030,6 +1043,7 @@ export async function POST(request: NextRequest) {
     // cross domains). Always perform a fresh CAPTCHA checkpoint on the page
     // that actually contains the discovered form. This prevents the earlier
     // landing-page "no CAPTCHA" result from being mistaken for the form page.
+    // Checkpoint 2 of the 3-check flow: homepage → **contact page** → post-submit.
     const discoveredPageUrl = String(page.url?.() || discovery.contactUrl || target);
     addInquiryLog({
       licenseId,
@@ -1047,32 +1061,45 @@ export async function POST(request: NextRequest) {
         licenseId,
         runId,
         level: 'warning',
-        message: `CAPTCHA detected (${provider}) on contact form ${discoveredPageUrl}`,
+        message: `CAPTCHA detected (${provider}) on contact form ${discoveredPageUrl}; attempting auto-solve`,
       });
-      session.targetUrl = target;
-      session.contactUrl = discoveredPageUrl;
-      session.lastPreparedAt = new Date().toISOString();
-      addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discoveredPageUrl, captchaProvider: provider, reason: 'CAPTCHA detected on inquiry form after contact-page navigation', values: profile as Record<string, unknown> });
-      await visualActionPause(page, 2200);
-      return NextResponse.json({
-        success: true,
-        classification: 'captcha',
-        target,
-        contactUrl: discoveredPageUrl,
-        currentUrl: page.url(),
-        discovery: discovery.discovery,
-        captchaDetected: true,
-        captchaProvider: provider,
-        detected: [], extras: [], submitVisible: false, fieldCount: 0,
+      // Attempt to solve at checkpoint 2 before giving up.
+      await solvePreloadCaptcha();
+      const unresolvedContactCaptcha = await detectCaptcha(page, discovery.form);
+      if (unresolvedContactCaptcha.detected) {
+        const unresolvedProvider = unresolvedContactCaptcha.provider || provider;
+        addInquiryLog({
+          licenseId,
+          runId,
+          level: 'warning',
+          message: `CAPTCHA (${unresolvedProvider}) still present on ${discoveredPageUrl} after solve attempt; saved and skipped`,
+        });
+        session.targetUrl = target;
+        session.contactUrl = discoveredPageUrl;
+        session.lastPreparedAt = new Date().toISOString();
+        addInquiryResult({ licenseId, runId, sessionId, status: 'captcha', target, contactUrl: discoveredPageUrl, captchaProvider: unresolvedProvider, reason: 'CAPTCHA detected on inquiry form after contact-page navigation', values: profile as Record<string, unknown> });
+        await visualActionPause(page, 2200);
+        return NextResponse.json({
+          success: true,
+          classification: 'captcha',
+          target,
+          contactUrl: discoveredPageUrl,
+          currentUrl: page.url(),
+          discovery: discovery.discovery,
+          captchaDetected: true,
+          captchaProvider: unresolvedProvider,
+          detected: [], extras: [], submitVisible: false, fieldCount: 0,
+        });
+      }
+      addInquiryLog({ licenseId, runId, level: 'success', message: `✓ CAPTCHA cleared on contact form ${discoveredPageUrl}` });
+    } else {
+      addInquiryLog({
+        licenseId,
+        runId,
+        level: 'info',
+        message: `no CAPTCHA on contact form ${discoveredPageUrl}`,
       });
     }
-
-    addInquiryLog({
-      licenseId,
-      runId,
-      level: 'info',
-      message: `no CAPTCHA detected on contact form ${discoveredPageUrl}`,
-    });
 
     await inquiryCheckpoint(licenseId);
     const form = await fillForm(page, discovery.form, profile);
