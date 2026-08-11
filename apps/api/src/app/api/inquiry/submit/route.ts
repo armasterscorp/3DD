@@ -3,7 +3,13 @@ import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-
 import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
 import { CaptchaStore } from '@/lib/captcha-store';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
-import { formatAttemptStep, getInquiryItemAttemptSignal, isActiveInquiryItemAttempt, type InquiryAttemptRef } from '@/lib/inquiry-item-lifecycle';
+import {
+  formatAttemptStep,
+  getInquiryItemAttempt,
+  isActiveInquiryItemAttempt,
+  renewInquiryItemOperation,
+  type InquiryAttemptRef,
+} from '@/lib/inquiry-item-lifecycle';
 import { classifyCaptchaAfterToken, shouldAttemptPreSubmitCaptchaSolve } from '@/lib/inquiry-submit-captcha-policy';
 
 export const runtime = 'nodejs';
@@ -380,7 +386,7 @@ export async function POST(request: NextRequest) {
       }
       : null;
     const isAttemptActive = () => !attemptRef || isActiveInquiryItemAttempt(attemptRef);
-    const attemptSignal = attemptRef ? getInquiryItemAttemptSignal(attemptRef) : null;
+    const getCaptchaAttemptSignal = () => (attemptRef ? renewInquiryItemOperation(attemptRef, 'captcha') : null);
     const attemptTag = (message: string) => attemptRef ? formatAttemptStep(message, attemptRef) : message;
     const log = (level: 'info' | 'success' | 'warning' | 'error', message: string) => {
       if (!isAttemptActive()) return;
@@ -432,7 +438,7 @@ export async function POST(request: NextRequest) {
     // 'not_found' is silent — the caller's detectCaptcha() is authoritative.
     // 'solver_unavailable' emits a one-time warning only on first call.
     let solverUnavailableLogged = false;
-    const solveCaptchaWithTimeout = async (message: string) => {
+    const solveCaptchaWithTimeout = async (message: string, activeForm: any) => {
       if (!captchaHandler) {
         if (!solverUnavailableLogged) {
           log('info', 'CAPTCHA auto-solver not configured — CAPTCHA will not be solved automatically');
@@ -440,6 +446,18 @@ export async function POST(request: NextRequest) {
         }
         return { status: 'solver_unavailable' as const };
       }
+      if (!activeForm) return { handled: false, status: 'not_found' as const };
+      const snapshot = attemptRef ? getInquiryItemAttempt(attemptRef) : null;
+      const activeFormCaptcha = await detectCaptcha(page, activeForm);
+      const shouldSolve = shouldAttemptPreSubmitCaptchaSolve({
+        captchaDetected: activeFormCaptcha.detected,
+        hasActiveTargetForm: !!activeForm,
+        activeTargetFormHasCaptcha: activeFormCaptcha.detected,
+        isItemTerminal: !!snapshot?.terminalState,
+        isCurrentAttempt: !attemptRef || isAttemptActive(),
+      });
+      if (!shouldSolve) return { handled: false, status: 'not_found' as const };
+      const captchaSignal = getCaptchaAttemptSignal();
       if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
       log('info', message);
       try {
@@ -449,9 +467,9 @@ export async function POST(request: NextRequest) {
             setTimeout(() => resolve({ handled: false, status: 'failed', error: 'captcha_timeout_after_75_seconds' }), INQUIRY_CAPTCHA_TIMEOUT_MS)
           ),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) => {
-            if (!attemptSignal) return;
-            if (attemptSignal.aborted) return resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' });
-            attemptSignal.addEventListener('abort', () => resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' }), { once: true });
+            if (!captchaSignal) return;
+            if (captchaSignal.aborted) return resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' });
+            captchaSignal.addEventListener('abort', () => resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' }), { once: true });
           }),
         ]);
         if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
@@ -505,8 +523,16 @@ export async function POST(request: NextRequest) {
       if (overlayState.reviewRequired) return saveReview(overlayState.reviewRequired);
 
       const captchaBeforeSubmit = await detectCaptcha(page, chosen);
-      if (shouldAttemptPreSubmitCaptchaSolve(captchaBeforeSubmit.detected)) {
-        const solvedPreSubmit = await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission');
+      if (
+        shouldAttemptPreSubmitCaptchaSolve({
+          captchaDetected: captchaBeforeSubmit.detected,
+          hasActiveTargetForm: !!chosen,
+          activeTargetFormHasCaptcha: captchaBeforeSubmit.detected,
+          isItemTerminal: false,
+          isCurrentAttempt: isAttemptActive(),
+        })
+      ) {
+        const solvedPreSubmit = await solveCaptchaWithTimeout('attempting to solve CAPTCHA before form submission', chosen);
         const tokenClassification = classifyCaptchaAfterToken(solvedPreSubmit.status === 'failed' && solvedPreSubmit.error === 'captcha_unsolved_after_token');
         if (tokenClassification.reviewRequired) {
           return saveReview(tokenClassification.reasonCode || 'captcha_unsolved_after_token');
@@ -571,7 +597,7 @@ export async function POST(request: NextRequest) {
         if (captchaHandler) {
           const postSubmitCaptcha = await captchaHandler.checkPostSubmitCaptcha(page);
           if (postSubmitCaptcha.detected) {
-            const solvedPostSubmit = await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve');
+            const solvedPostSubmit = await solveCaptchaWithTimeout('post-submit CAPTCHA detected, attempting to solve', chosen);
             const tokenClassification = classifyCaptchaAfterToken(solvedPostSubmit.status === 'failed' && solvedPostSubmit.error === 'captcha_unsolved_after_token');
             if (tokenClassification.reviewRequired) {
               return saveReview(tokenClassification.reasonCode || 'captcha_unsolved_after_token');

@@ -3,7 +3,12 @@ import { cleanInquirySessionId, getInquirySession } from '@/lib/inquiry-browser-
 import { addInquiryLog, addInquiryResult, getInquiryLicenseId, getInquiryRunState, inquiryCheckpoint, InquiryRunStoppedError } from '@/lib/inquiry-run-store';
 import { CaptchaStore } from '@/lib/captcha-store';
 import { InquiryCaptchaHandler } from '@/lib/inquiry-captcha-handler';
-import { formatAttemptStep, getInquiryItemAttemptSignal, isActiveInquiryItemAttempt, type InquiryAttemptRef } from '@/lib/inquiry-item-lifecycle';
+import {
+  formatAttemptStep,
+  isActiveInquiryItemAttempt,
+  renewInquiryItemOperation,
+  type InquiryAttemptRef,
+} from '@/lib/inquiry-item-lifecycle';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -900,7 +905,7 @@ export async function POST(request: NextRequest) {
       }
       : null;
     const isAttemptActive = () => !attemptRef || isActiveInquiryItemAttempt(attemptRef);
-    const attemptSignal = attemptRef ? getInquiryItemAttemptSignal(attemptRef) : null;
+    const getCaptchaAttemptSignal = () => (attemptRef ? renewInquiryItemOperation(attemptRef, 'captcha') : null);
     const attemptTag = (message: string) => attemptRef ? formatAttemptStep(message, attemptRef) : message;
     const log = (level: 'info' | 'success' | 'warning' | 'error', message: string) => {
       if (!isAttemptActive()) return;
@@ -950,14 +955,18 @@ export async function POST(request: NextRequest) {
     // the caller always performs its own authoritative detectCaptcha() check
     // afterwards; emitting it inside the solver would produce contradictory log
     // pairs ("no CAPTCHA detected" → "CAPTCHA detected on the landing page").
-    const solvePreloadCaptcha = async () => {
+    const solveActiveFormCaptcha = async (activeForm: any, contextLabel: string) => {
       if (!captchaHandler) {
         log('info', 'CAPTCHA auto-solver not configured — CAPTCHA will not be solved automatically');
         return { status: 'solver_unavailable' as const };
       }
+      if (!activeForm) return { handled: false, status: 'not_found' as const };
+      const detectedOnActiveForm = await detectCaptcha(page, activeForm);
+      if (!detectedOnActiveForm.detected) return { handled: false, status: 'not_found' as const };
       const captchaCheckUrl = String(page.url?.() || target);
+      const captchaSignal = getCaptchaAttemptSignal();
       if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
-      log('info', `checking CAPTCHA on ${captchaCheckUrl}`);
+      log('info', `${contextLabel} on ${captchaCheckUrl}`);
       try {
         const result = await Promise.race([
           captchaHandler.handleCaptcha(page),
@@ -965,9 +974,9 @@ export async function POST(request: NextRequest) {
             setTimeout(() => resolve({ handled: false, status: 'failed', error: 'captcha_timeout_after_75_seconds' }), INQUIRY_CAPTCHA_TIMEOUT_MS)
           ),
           new Promise<{ handled: false; status: 'failed'; error: string }>((resolve) => {
-            if (!attemptSignal) return;
-            if (attemptSignal.aborted) return resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' });
-            attemptSignal.addEventListener('abort', () => resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' }), { once: true });
+            if (!captchaSignal) return;
+            if (captchaSignal.aborted) return resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' });
+            captchaSignal.addEventListener('abort', () => resolve({ handled: false, status: 'failed', error: 'attempt_cancelled' }), { once: true });
           }),
         ]);
         if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
@@ -975,7 +984,7 @@ export async function POST(request: NextRequest) {
           // A solver returning a token is not the same thing as the page accepting
           // the CAPTCHA. Verify the live page before reporting completion.
           await page.waitForTimeout(450).catch(() => undefined);
-          const stillRequired = await detectCaptcha(page);
+          const stillRequired = await detectCaptcha(page, activeForm);
           if (!isAttemptActive()) return { handled: false, status: 'failed' as const, error: 'attempt_stale' };
           if (stillRequired.detected) {
             log('warning', `CAPTCHA solution returned, but ${stillRequired.provider || 'CAPTCHA'} is still required on ${String(page.url?.() || captchaCheckUrl)}`);
@@ -1023,8 +1032,6 @@ export async function POST(request: NextRequest) {
       // page before discovery can immediately navigate elsewhere or classify it.
       await visualActionPause(page, 900);
       await inquiryCheckpoint(licenseId);
-      await solvePreloadCaptcha();
-      throwIfStale();
       const unresolvedLandingCaptcha = await detectCaptcha(page);
       if (unresolvedLandingCaptcha.detected) {
         return await saveCaptchaClassification(unresolvedLandingCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected on the landing page before form discovery');
@@ -1032,12 +1039,7 @@ export async function POST(request: NextRequest) {
     } catch (navigationError) {
       const challenge = await detectCaptcha(page);
       if (challenge.detected) {
-        await solvePreloadCaptcha();
-        throwIfStale();
-        const unresolvedChallenge = await detectCaptcha(page);
-        if (unresolvedChallenge.detected) {
-          return await saveCaptchaClassification(unresolvedChallenge.provider || 'CAPTCHA', 'CAPTCHA/human verification blocked page navigation');
-        }
+        return await saveCaptchaClassification(challenge.provider || 'CAPTCHA', 'CAPTCHA/human verification blocked page navigation');
       }
       if (isUnavailableNavigationError(navigationError)) {
         storeResult({ status: 'failed', contactUrl: page.url() || target, reason: shortUnavailableReason(navigationError), values: profile as Record<string, unknown> });
@@ -1059,12 +1061,7 @@ export async function POST(request: NextRequest) {
 
     const pageCaptcha = await detectCaptcha(page);
     if (pageCaptcha.detected) {
-      await solvePreloadCaptcha();
-      throwIfStale();
-      const unresolvedPageCaptcha = await detectCaptcha(page);
-      if (unresolvedPageCaptcha.detected) {
-        return await saveCaptchaClassification(unresolvedPageCaptcha.provider || pageCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected before contact-form discovery');
-      }
+      return await saveCaptchaClassification(pageCaptcha.provider || 'CAPTCHA', 'CAPTCHA detected before contact-form discovery');
     }
 
     await inquiryCheckpoint(licenseId);
@@ -1106,7 +1103,7 @@ export async function POST(request: NextRequest) {
       const provider = captcha.provider || 'CAPTCHA';
       log('warning', `CAPTCHA detected (${provider}) on contact form ${discoveredPageUrl}; attempting auto-solve`);
       // Attempt to solve at checkpoint 2 before giving up.
-      const solveResult = await solvePreloadCaptcha();
+      const solveResult = await solveActiveFormCaptcha(discovery.form, 'attempting to solve CAPTCHA on active contact form');
       if (solveResult.status === 'failed' && solveResult.error === 'captcha_unsolved_after_token') {
         const reason = 'captcha_unsolved_after_token';
         storeResult({ status: 'review', contactUrl: discoveredPageUrl, reason, values: profile as Record<string, unknown> });
