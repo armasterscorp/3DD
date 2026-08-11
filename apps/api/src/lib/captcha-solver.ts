@@ -411,7 +411,7 @@ export class TwoCaptchaSolver {
       } catch (error: any) {
         // Re-throw typed errors without wrapping.
         if (error instanceof CaptchaCancelledError || error instanceof CaptchaSolverTimeoutError) throw error;
-        if (shouldLog) console.error(`[2Captcha] Poll error${ctxTag}:`, error.message);
+        if (shouldLog) console.error('[2Captcha] Poll error', ctxTag, error.message);
         continue;
       }
     }
